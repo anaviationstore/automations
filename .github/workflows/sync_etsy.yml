@@ -1,4 +1,4 @@
-name: Sync Etsy → Sheets
+name: Sync Etsy to Sheets
 
 on:
   workflow_dispatch:
