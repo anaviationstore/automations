@@ -27,7 +27,7 @@ jobs:
         env:
           WALLAPOP_PROFILE_URL: ${{ secrets.WALLAPOP_PROFILE_URL }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: ${{ secrets.SHEET_TAB }}
+          SHEET_TAB: ${{ secrets.SHEET_TAB_WALLAPOP }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_SA_JSON }}
         run: |
           python sync_wallapop_to_sheets.py
