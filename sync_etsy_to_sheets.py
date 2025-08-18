@@ -1,387 +1,191 @@
-# sync_etsy_to_sheets.py
-import os, re, json, time, random
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse
-
+import os, re, json, time, requests
+from datetime import datetime, timezone
 import gspread
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# ========= Config =========
-ETSY_PROFILE_URL = os.getenv("ETSY_PROFILE_URL", "").strip()   # p.ej. https://www.etsy.com/shop/TuTienda
-SHEET_ID       = os.getenv("SHEET_ID", "").strip()
-SHEET_TAB      = os.getenv("SHEET_TAB", "etsy_items").strip()
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON", "").strip()
+# ---------- Config ----------
+SHEET_ID       = os.getenv("SHEET_ID")
+SHEET_TAB      = os.getenv("SHEET_TAB_ETSY", "etsy_items")
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
 
-if not (ETSY_PROFILE_URL and SHEET_ID and GOOGLE_SA_JSON):
-    raise SystemExit("Faltan variables: ETSY_PROFILE_URL, SHEET_ID o GOOGLE_SA_JSON")
+ETSY_PROFILE_URL   = os.getenv("ETSY_PROFILE_URL") or os.getenv("ETSY_SHOP_URL") or ""
+ETSY_SHOP_ID       = os.getenv("ETSY_SHOP_ID", "").strip()
+ETSY_SHOP_NAME     = os.getenv("ETSY_SHOP_NAME", "").strip()  # opcional si ya tienes la URL de la shop
+ETSY_CLIENT_ID     = os.getenv("ETSY_CLIENT_ID", "").strip()  # "keystring"
+ETSY_REFRESH_TOKEN = os.getenv("ETSY_REFRESH_TOKEN", "").strip()
 
-parsed = urlparse(ETSY_PROFILE_URL)
-ORIGIN = f"{parsed.scheme}://{parsed.netloc}"
+if not (SHEET_ID and GOOGLE_SA_JSON and ETSY_CLIENT_ID and ETSY_REFRESH_TOKEN):
+    raise SystemExit("Faltan variables: SHEET_ID, GOOGLE_SA_JSON, ETSY_CLIENT_ID o ETSY_REFRESH_TOKEN")
 
-# Columnas
+# ---------- Google Sheets ----------
+creds = Credentials.from_service_account_info(
+    json.loads(GOOGLE_SA_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+gc = gspread.authorize(creds)
+sh = gc.open_by_key(SHEET_ID)
+try:
+    ws = sh.worksheet(SHEET_TAB)
+except gspread.exceptions.WorksheetNotFound:
+    ws = sh.add_worksheet(title=SHEET_TAB, rows=2, cols=12)
+
 HEADERS = [
-    "id", "title", "price", "currency", "availability",
-    "category", "tags", "url", "image", "description",
-    "shop_name", "shop_url", "timestamp_utc",
+    "id","title","price","currency","url","state",
+    "tags","description","shop_name","shop_url","timestamp_utc"
 ]
 
-# ========= Sheets =========
-def get_ws():
-    creds = Credentials.from_service_account_info(
-        json.loads(GOOGLE_SA_JSON),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
-    try:
-        ws = sh.worksheet(SHEET_TAB)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_TAB, rows=2, cols=len(HEADERS) + 5)
-    return ws
+def a1(end_col, end_row):
+    # end_col: número -> A, B, C ...
+    def col_name(n):
+        s=""
+        while n>0:
+            n, r = divmod(n-1, 26)
+            s = chr(65+r)+s
+        return s
+    return f"A1:{col_name(end_col)}{end_row}"
 
-def write_headers(ws):
+def write_headers():
     ws.clear()
-    ws.update(range_name=f"A1:{_col_letter(len(HEADERS))}1", values=[HEADERS])
+    ws.update(range_name=a1(len(HEADERS), 1), values=[HEADERS])
 
-def write_rows(ws, rows: List[Dict[str, Any]]):
+def write_rows(rows):
     if not rows:
         return
-    values = [[r.get(k, "") for k in HEADERS] for r in rows]
-    need = len(values) - (ws.row_count - 1)
+    need = len(rows) - (ws.row_count - 1)
     if need > 0:
         ws.add_rows(need)
-    ws.update(range_name=f"A2:{_col_letter(len(HEADERS))}{len(values)+1}", values=values, value_input_option="RAW")
+    ws.update(range_name=a1(len(HEADERS), len(rows)+1), values=rows)
 
-def _col_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+# ---------- Etsy API helpers ----------
+API_BASE = "https://api.etsy.com/v3"
 
-# ========= Helpers Etsy =========
-LISTING_ID_RE = re.compile(r"/listing/(\d+)")
-RATE_LIMIT_MARKERS = ("robot check", "verify you are a human", "are you a human", "unusual traffic")
-
-def accept_cookies_if_any(page):
-    # OneTrust (muy común en Etsy)
-    for sel in ["#onetrust-accept-btn-handler", "button#onetrust-accept-btn-handler"]:
-        try:
-            page.locator(sel).click(timeout=1200)
-            page.wait_for_timeout(250)
-            print("[etsy] cookies: OneTrust aceptado")
-            return
-        except Exception:
-            pass
-    # Otros banners genéricos
-    texts = ["Accept", "Accept all", "Aceptar", "Aceptar todo", "Permitir"]
-    for t in texts:
-        try:
-            page.locator(f"button:has-text('{t}')").first.click(timeout=1200)
-            page.wait_for_timeout(250)
-            print("[etsy] cookies: botón por texto aceptado:", t)
-            return
-        except Exception:
-            pass
-    # Formularios GDPR varios
-    for sel in ["form[data-gdpr] button[type=submit]", "div[role='dialog'] button[type=submit]"]:
-        try:
-            page.locator(sel).first.click(timeout=1200)
-            page.wait_for_timeout(250)
-            print("[etsy] cookies: formulario/diálogo aceptado")
-            return
-        except Exception:
-            pass
-    print("[etsy] cookies: no apareció banner")
-
-def is_blocked(title: str) -> bool:
-    t = (title or "").lower()
-    return any(x in t for x in RATE_LIMIT_MARKERS)
-
-def backoff(attempt: int):
-    base = min(20, 3 * (2 ** (attempt - 1)))
-    time.sleep(base + random.uniform(0, 2))
-
-def parse_json_ld(text: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return out
-    nodes = data if isinstance(data, list) else [data]
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        t = node.get("@type")
-        if (isinstance(t, list) and "Product" in t) or t == "Product":
-            out["title"] = node.get("name", "")
-            out["description"] = node.get("description", "")
-            img = node.get("image", "")
-            if isinstance(img, list):
-                img = img[0] if img else ""
-            out["image"] = img or ""
-            offers = node.get("offers") or {}
-            if isinstance(offers, list):
-                offers = offers[0] if offers else {}
-            price = ""
-            currency = ""
-            availability = ""
-            if offers:
-                availability = offers.get("availability", "")
-                if "AggregateOffer" in str(offers.get("@type")):
-                    price = str(offers.get("lowPrice") or offers.get("highPrice") or "")
-                    currency = offers.get("priceCurrency", "") or ""
-                else:
-                    price = str(offers.get("price", "") or "")
-                    currency = offers.get("priceCurrency", "") or ""
-            out["price"] = price
-            out["currency"] = currency
-            out["availability"] = availability
-            out["url"] = node.get("url", "")
-            out["category"] = ""
-            cats = node.get("category")
-            if isinstance(cats, list):
-                out["category"] = " > ".join(cats)
-            elif isinstance(cats, str):
-                out["category"] = cats
-            out["tags"] = ""
-            kws = node.get("keywords")
-            if isinstance(kws, list):
-                out["tags"] = ", ".join(kws)
-            elif isinstance(kws, str):
-                out["tags"] = kws
-            out["id"] = str(node.get("sku") or node.get("productID") or "")
-            return out
-    return out
-
-def extract_text(page, sel: str, timeout=1200) -> str:
-    try:
-        el = page.wait_for_selector(sel, timeout=timeout)
-        return (el.inner_text() or "").strip()
-    except Exception:
-        return ""
-
-def extract_attr(page, sel: str, attr: str, timeout=1200) -> str:
-    try:
-        el = page.wait_for_selector(sel, timeout=timeout)
-        return (el.get_attribute(attr) or "").strip()
-    except Exception:
-        return ""
-
-def fallback_from_dom(page) -> Dict[str, Any]:
-    data = {}
-    for s in ["h1[data-buy-box-listing-title]", "h1[data-listing-page-title]", "h1"]:
-        t = extract_text(page, s)
-        if t:
-            data["title"] = t
-            break
-    for s in [
-        "[data-buy-box-region='price'] p",
-        "p[data-buy-box-price]",
-        "span.wt-text-title-03",
-        "[data-appears-component-name='price'] span"
-    ]:
-        p = extract_text(page, s)
-        if p:
-            data["price"] = re.sub(r"[^\d,.\-]", "", p).replace(",", ".")
-            break
-    txt = extract_text(page, "[data-buy-box-region='price'], p[data-buy-box-price], .wt-text-title-03")
-    if "€" in txt: data["currency"] = "EUR"
-    elif "$" in txt: data["currency"] = "USD"
-    elif "£" in txt: data["currency"] = "GBP"
-    data["image"] = (
-        extract_attr(page, "img[data-listing-image]", "src")
-        or extract_attr(page, "img[data-palette-listing-image]", "src")
-        or extract_attr(page, "figure img", "src")
-    )
-    if "Sold out" in page.content() or "Agotado" in page.content():
-        data["availability"] = "SoldOut"
-    cat = extract_text(page, "nav[aria-label*='Breadcrumb'] li:last-child a, nav[aria-label*='Migas'] li:last-child a")
-    if cat:
-        data["category"] = cat
-    return data
-
-def _normalize(full: str) -> str:
-    if not full: return ""
-    if full.startswith("/"): full = ORIGIN + full
-    elif not full.startswith("http"): full = ORIGIN + "/" + full
-    return full.split("?")[0]
-
-def _gather_listing_links(page) -> list[str]:
-    links = set()
-    # enlaces con data-listing-id o a /listing/
-    for sel in ["a[data-listing-id]", "a[href*='/listing/']",
-                "ul li a[href*='/listing/']", "a.wt-card__link", "a.listing-link"]:
-        try:
-            hrefs = page.eval_on_selector_all(sel, "els => els.map(e => e.href || e.getAttribute('href'))")
-            for h in hrefs or []:
-                h = _normalize(h)
-                if "/listing/" in h: links.add(h)
-        except Exception:
-            pass
-    return sorted(links)
-
-def collect_shop_item_urls(page, shop_url: str) -> (str, str, List[str]):
-    urls = set()
-    shop_name = ""
-    variants = [
-        shop_url,
-        shop_url.rstrip("/"),
-        shop_url.rstrip("/") + "/items",
-        shop_url.rstrip("/") + "/search?order=date_desc",
-        shop_url.replace("://www.etsy.com/", "://www.etsy.com/es/"),
-        shop_url.replace("://www.etsy.com/", "://www.etsy.com/es/").rstrip("/") + "/items",
-    ]
-    seen_variants = set()
-    page_num = 1
-
-    for base in variants:
-        if base in seen_variants: continue
-        seen_variants.add(base)
-        for pn in range(1, 6):  # hasta 5 páginas por variante
-            url = base if pn == 1 else base + (("&" if "?" in base else "?") + f"page={pn}")
-            print(f"[etsy] goto page {pn} -> {url}")
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            title = page.title()
-            if title and title.strip().lower() in {"etsy.com", "etsy"}:
-                print("[etsy] aviso: título genérico tras goto (posible redirección o challenge).")
-            if pn == 1:
-                accept_cookies_if_any(page)
-                # nombre tienda
-                for sel in ["h1[data-ui='shop-name']", "h1.wt-text-heading-01", "h1[data-shop-home-title]", "h1"]:
-                    try:
-                        txt = page.locator(sel).first.inner_text().strip()
-                        if txt:
-                            shop_name = txt
-                            break
-                    except Exception:
-                        pass
-                print("[etsy] shop_name:", shop_name or "(no encontrado)")
-
-            # Espera rejilla o tarjetas; si no, scrollea un poco para forzar carga
-            try:
-                page.wait_for_selector("a[data-listing-id], a[href*='/listing/']", timeout=5000)
-            except Exception:
-                for _ in range(6):
-                    page.evaluate("window.scrollBy(0, document.body.scrollHeight/3)")
-                    page.wait_for_timeout(400)
-
-            found = _gather_listing_links(page)
-            print(f"[etsy] page {pn} -> found:{len(found)}")
-            before = len(urls)
-            urls.update(found)
-            added = len(urls) - before
-            print(f"[etsy] added:{added} total:{len(urls)}")
-
-            # si no añadió nada en la primera página de esta variante, pasa a la siguiente variante
-            if pn == 1 and added == 0:
-                break
-
-            # detección de “no hay siguiente”: busca botón next
-            has_next = False
-            try:
-                nxt = page.locator("a[aria-label*='Next'], a[aria-label*='Siguiente'], nav ul li a[rel='next']").first
-                has_next = bool(nxt and nxt.is_enabled())
-            except Exception:
-                pass
-            if not has_next:
-                break
-
-            page.wait_for_timeout(700 + int(random.uniform(0, 400)))
-
-    return shop_name or "", shop_url, sorted(urls)
-
-def fetch_item(page, url: str, shop_name: str, shop_url: str) -> Dict[str, Any]:
-    for attempt in range(1, 4):
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        title = page.title()
-        if title and title.strip().lower() in {"etsy.com", "etsy"}:
-            print("[etsy] aviso: título genérico tras goto (posible redirección o challenge).")
-        if is_blocked(page.title()):
-            if attempt < 3:
-                backoff(attempt)
-                continue
-        break
-    parsed: Dict[str, Any] = {}
-    try:
-        scripts = page.query_selector_all('script[type="application/ld+json"]')
-        for s in scripts:
-            txt = s.text_content()
-            if not txt:
-                continue
-            parsed = parse_json_ld(txt)
-            if parsed.get("title"):
-                break
-    except Exception:
-        parsed = {}
-    if not parsed.get("title"):
-        parsed = {**fallback_from_dom(page), **parsed}
-    listing_id = parsed.get("id") or ""
-    if not listing_id:
-        m = LISTING_ID_RE.search(url)
-        if m:
-            listing_id = m.group(1)
-    row = {
-        "id": listing_id,
-        "title": parsed.get("title", ""),
-        "price": parsed.get("price", ""),
-        "currency": parsed.get("currency", ""),
-        "availability": parsed.get("availability", ""),
-        "category": parsed.get("category", ""),
-        "tags": parsed.get("tags", ""),
-        "url": parsed.get("url") or url,
-        "image": parsed.get("image", ""),
-        "description": parsed.get("description", ""),
-        "shop_name": shop_name,
-        "shop_url": shop_url,
-        "timestamp_utc": datetime.utcnow().isoformat(),
+def oauth_refresh():
+    """Intercambia el refresh token por un access token."""
+    url = f"{API_BASE}/public/oauth/token"
+    body = {
+        "grant_type": "refresh_token",
+        "client_id": ETSY_CLIENT_ID,
+        "refresh_token": ETSY_REFRESH_TOKEN,
     }
-    return row
+    r = requests.post(url, json=body, timeout=30)
+    if not r.ok:
+        raise SystemExit(f"OAuth refresh failed: {r.status_code} {r.text}")
+    data = r.json()
+    # Etsy devuelve un access_token en formato "<user_id>.<token>"
+    return data["access_token"]
 
-# ========= Main =========
-def run():
-    ws = get_ws()
-    write_headers(ws)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox","--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-        ])
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/126.0.0.0 Safari/537.36"),
-            locale="es-ES",
-            timezone_id="Europe/Madrid",
-            viewport={"width": 1366, "height": 768},
-            device_scale_factor=1.0,
-        )
-        # stealth: quitar webdriver, añadir chrome/plugs/languages
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['es-ES','es','en-US','en']});
-        """)
-        page = context.new_page()
-        shop_name, shop_url, item_urls = collect_shop_item_urls(page, ETSY_PROFILE_URL)
-        print(f"Encontrados {len(item_urls)} listings en la tienda '{shop_name or 'N/D'}'.")
-        rows: List[Dict[str, Any]] = []
-        for i, url in enumerate(item_urls, 1):
-            try:
-                rows.append(fetch_item(page, url, shop_name, shop_url))
-            except Exception as e:
-                print(f"Error en {url}: {e}")
-            time.sleep(random.uniform(0.7, 1.4))
-            if i % 25 == 0:
-                time.sleep(random.uniform(5, 8))
-        context.close()
-        browser.close()
-    write_rows(ws, rows)
+def auth_headers(access_token: str):
+    return {
+        "x-api-key": ETSY_CLIENT_ID,
+        "Authorization": f"Bearer {access_token}",
+    }
+
+def shop_name_from_url(url: str) -> str:
+    if not url: return ""
+    m = re.search(r"/shop/([^/?#]+)", url)
+    return m.group(1) if m else ""
+
+def resolve_shop_id(access_token: str):
+    """Devuelve (shop_id, shop_name)"""
+    if ETSY_SHOP_ID:
+        # si no conocemos el nombre, lo intentamos consultar
+        try:
+            r = requests.get(f"{API_BASE}/application/shops/{ETSY_SHOP_ID}",
+                             headers=auth_headers(access_token), timeout=30)
+            name = ""
+            if r.ok:
+                sj = r.json()
+                name = sj.get("shop_name") or sj.get("shop_name_full") or ""
+            return ETSY_SHOP_ID, name
+        except Exception:
+            return ETSY_SHOP_ID, ""
+    name = ETSY_SHOP_NAME or shop_name_from_url(ETSY_PROFILE_URL)
+    if not name:
+        raise SystemExit("Necesito ETSY_SHOP_ID o ETSY_SHOP_NAME o ETSY_PROFILE_URL para resolver la tienda.")
+    # Endpoint de búsqueda por nombre
+    url = f"{API_BASE}/application/shops?shop_name={name}"
+    r = requests.get(url, headers=auth_headers(access_token), timeout=30)
+    if not r.ok:
+        raise SystemExit(f"No pude resolver shop_id para '{name}': {r.status_code} {r.text}")
+    data = r.json()
+    # distintos wrappers posibles: "results", "shops", "data"...
+    shop = None
+    for key in ("results","shops","data"):
+        if isinstance(data.get(key), list) and data[key]:
+            shop = data[key][0]; break
+    if not shop and "shop_id" in data:
+        shop = data
+    if not shop or "shop_id" not in shop:
+        raise SystemExit(f"Respuesta inesperada al resolver '{name}': {data}")
+    return str(shop["shop_id"]), shop.get("shop_name", name)
+
+def fetch_active_listings(access_token: str, shop_id: str):
+    """Pagina por todas las publicaciones activas."""
+    all_items = []
+    limit, offset = 100, 0
+    base = f"{API_BASE}/application/shops/{shop_id}/listings/active"
+    while True:
+        url = f"{base}?limit={limit}&offset={offset}"
+        r = requests.get(url, headers=auth_headers(access_token), timeout=30)
+        if not r.ok:
+            raise SystemExit(f"Error en listings: {r.status_code} {r.text}")
+        payload = r.json()
+        results = payload.get("results") or payload.get("listings") or payload.get("data") or []
+        if not isinstance(results, list):
+            results = []
+        all_items.extend(results)
+        total = payload.get("count", 0)
+        offset += limit
+        if len(all_items) >= total or not results:
+            break
+        time.sleep(0.2)
+    return all_items
+
+def money_to_str(m):
+    """Convierte objeto money {amount, divisor, currency_code} a ('12.34','EUR')."""
+    if not isinstance(m, dict): return "", ""
+    amount = m.get("amount")
+    divisor = m.get("divisor") or 100
+    curr = m.get("currency_code") or ""
+    try:
+        val = float(amount) / float(divisor)
+        s = f"{val:.2f}".rstrip('0').rstrip('.')
+    except Exception:
+        s = ""
+    return s, curr
+
+def normalize_row(li: dict, shop_name: str, shop_url: str):
+    listing_id = li.get("listing_id") or li.get("listingId") or li.get("id")
+    title = li.get("title","")
+    state = li.get("state","")
+    url = f"https://www.etsy.com/listing/{listing_id}" if listing_id else ""
+
+    # precio puede venir como objeto money o como número+currency_code
+    price_val, curr = "", ""
+    p = li.get("price")
+    if isinstance(p, dict):
+        price_val, curr = money_to_str(p)
+    elif isinstance(p, (int,float,str)):
+        price_val = str(p); curr = li.get("currency_code","")
+    else:
+        price_val, curr = money_to_str(li.get("original_price", {}))
+
+    tags = ", ".join(li.get("tags", []) or [])
+    desc = (li.get("description") or "").strip()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return [str(listing_id or ""), title, price_val, curr, url, state, tags, desc, shop_name or "", shop_url or "", ts]
+
+def main():
+    write_headers()
+    token = oauth_refresh()
+    shop_id, shop_name = resolve_shop_id(token)
+    shop_url = ETSY_PROFILE_URL or (f"https://www.etsy.com/shop/{shop_name}" if shop_name else "")
+
+    items = fetch_active_listings(token, shop_id)
+    print(f"Total listings: {len(items)}")
+    rows = [normalize_row(li, shop_name, shop_url) for li in items]
+    write_rows(rows)
     print("Finalizado.")
 
 if __name__ == "__main__":
-    run()
+    main()
