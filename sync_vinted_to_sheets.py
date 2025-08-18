@@ -1,5 +1,6 @@
 # sync_vinted_to_sheets.py
 import os, json, time
+import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -29,7 +30,7 @@ HEADERS = ["id", "title", "price", "currency", "url", "brand", "size", "status"]
 
 def write_headers():
     ws.clear()
-    ws.update(range_name="A1:H1", values=[HEADERS])  # evita el warning deprecado
+    ws.update(range_name="A1:H1", values=[HEADERS])  # evita warning deprecado
 
 def write_rows(items):
     if not items:
@@ -46,37 +47,63 @@ def write_rows(items):
             it.get("size",""),
             it.get("status",""),
         ])
-    # añadir filas si faltan
     needed = len(rows) - (ws.row_count - 1)
     if needed > 0:
         ws.add_rows(needed)
     ws.update(range_name=f"A2:H{len(rows)+1}", values=rows)
 
-# ---------- Normalizador de respuestas del wrapper ----------
-def extract_items_from_resp(resp):
-    """
-    El wrapper 'vinted' a veces devuelve:
-    - lista de objetos (con atributos .id, .title, etc.)
-    - objeto con atributo .items (lista)
-    - dict con clave 'items' (lista)
-    - lista de dicts
-    Esta función devuelve siempre una lista de "records" dict.
-    """
-    # 1) dict con clave 'items'
-    if isinstance(resp, dict):
-        data_items = resp.get("items", [])
-    else:
-        # 2) objeto con atributo .items que NO sea callable (lista)
-        attr = getattr(resp, "items", None)
-        if attr is not None and not callable(attr):
-            data_items = attr
-        else:
-            # 3) lista directa (de objetos o dicts)
-            data_items = resp if isinstance(resp, list) else []
+# ---------- Fetch directo con requests (manteniendo cookies) ----------
+def fetch_items_requests(user_id:int, domain:str):
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"https://www.vinted.{domain}/",
+    })
 
-    norm = []
-    for x in data_items:
-        if isinstance(x, dict):
+    # 1) Visita la home para obtener cookies anti-bot
+    home = f"https://www.vinted.{domain}/"
+    r_home = sess.get(home, timeout=20)
+    print("[requests] home status:", r_home.status_code)
+
+    base = f"https://www.vinted.{domain}/api/v2/catalog/items"
+    page, per_page = 1, 96
+    results = []
+
+    while True:
+        params = {
+            "page": page,
+            "per_page": per_page,
+            "order": "newest_first",
+            "status": "active",
+            "user_id": user_id,
+            "search_text": "",
+        }
+        r = sess.get(base, params=params, timeout=25)
+        print(f"[requests] page={page} status={r.status_code} len={len(r.content)}")
+        if r.status_code != 200:
+            # Reintento simple tras pausar (a veces el primer intento necesita refrescar cookie)
+            time.sleep(1.0)
+            r = sess.get(base, params=params, timeout=25)
+            print(f"[requests] retry page={page} status={r.status_code}")
+
+        if r.status_code != 200:
+            print("[requests] abort: status", r.status_code, "snippet:", r.text[:180])
+            break
+
+        try:
+            data = r.json()
+        except Exception as e:
+            print("[requests] json error:", repr(e), "snippet:", r.text[:180])
+            break
+
+        items = data.get("items", [])
+        print(f"[requests] items this page: {len(items)}")
+        if not items:
+            break
+
+        for x in items:
+            # price puede ser dict o string
             price_field = x.get("price", "")
             if isinstance(price_field, dict):
                 price_val = price_field.get("amount", "")
@@ -85,9 +112,8 @@ def extract_items_from_resp(resp):
                 price_val = price_field
                 currency = x.get("currency") or x.get("currency_code", "")
 
-            url_item = x.get("url") or (f"https://www.vinted.{VINTED_DOMAIN}{x.get('path')}" if x.get("path") else "")
-
-            norm.append({
+            url_item = x.get("url") or (f"https://www.vinted.{domain}{x.get('path')}" if x.get("path") else "")
+            results.append({
                 "id": x.get("id", ""),
                 "title": x.get("title", ""),
                 "price": price_val,
@@ -97,37 +123,7 @@ def extract_items_from_resp(resp):
                 "size": x.get("size_title", ""),
                 "status": x.get("status", ""),
             })
-        else:
-            # objeto del wrapper
-            norm.append({
-                "id": getattr(x, "id", ""),
-                "title": getattr(x, "title", ""),
-                "price": getattr(x, "price", "") or getattr(x, "price_numeric", ""),
-                "currency": getattr(x, "currency", "") or getattr(x, "currency_code", ""),
-                "url": getattr(x, "url", ""),
-                "brand": getattr(x, "brand_title", ""),
-                "size": getattr(x, "size_title", ""),
-                "status": getattr(x, "status", ""),
-            })
-    return norm
 
-# ---------- Fetch con wrapper (pasando URL como argumento posicional) ----------
-def fetch_items(user_id:int, domain:str):
-    from vinted import Vinted
-    v = Vinted(domain=domain)
-
-    base_url = f"https://www.vinted.{domain}/catalog?user_id={user_id}&status=active&order=newest_first"
-    page, per_page = 1, 96  # el wrapper usa 96 por defecto; mantenemos ese valor
-    results = []
-
-    while True:
-        url = f"{base_url}&page={page}&per_page={per_page}"
-        resp = v.search(url)  # PRIMER argumento posicional, sin kwargs
-        items_list = extract_items_from_resp(resp)
-        print(f"[wrapper-url] page={page} items={len(items_list)}")
-        if not items_list:
-            break
-        results.extend(items_list)
         page += 1
         time.sleep(0.3)
 
@@ -136,7 +132,7 @@ def fetch_items(user_id:int, domain:str):
 # ---------- Main ----------
 def main():
     write_headers()
-    items = fetch_items(int(VINTED_USER_ID), VINTED_DOMAIN)
+    items = fetch_items_requests(int(VINTED_USER_ID), VINTED_DOMAIN)
     print(f"Total artículos: {len(items)}")
     if items:
         write_rows(items)
