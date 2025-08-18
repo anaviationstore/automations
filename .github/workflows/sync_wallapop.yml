@@ -8,6 +8,12 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+      WALLAPOP_PROFILE_URL: ${{ secrets.WALLAPOP_PROFILE_URL }}
+      SHEET_TAB: wallapop_items   # nombre fijo de la pestaña (no es secret)
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,14 +26,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright gspread oauth2client
+          pip install playwright gspread google-auth
           playwright install --with-deps chromium
 
       - name: Run sync
-        env:
-          WALLAPOP_PROFILE_URL: ${{ secrets.WALLAPOP_PROFILE_URL }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: ${{ secrets.SHEET_TAB_WALLAPOP }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_SA_JSON }}
         run: |
           python sync_wallapop_to_sheets.py
