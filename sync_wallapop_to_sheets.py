@@ -16,7 +16,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 WALLAPOP_PROFILE_URL = os.getenv("WALLAPOP_PROFILE_URL", "").strip()  # p.ej. https://es.wallapop.com/app/user/XXXX
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_TAB = os.getenv("SHEET_TAB", "wallapop_items").strip()
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_SA_JSON", "").strip()
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS", "").strip()
 
 # Columnas de salida: añade/quita si quieres
 OUTPUT_COLUMNS = [
