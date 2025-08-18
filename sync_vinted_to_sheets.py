@@ -43,6 +43,65 @@ def write_rows(items):
         ws.add_rows(need)
     ws.update(range_name=f"A2:H{len(rows)+1}", values=rows)
 
+# ---------- Utilidades precio/moneda ----------
+CURRENCY_MAP = {
+    "€": "EUR", "EUR": "EUR",
+    "$": "USD", "USD": "USD",
+    "£": "GBP", "GBP": "GBP",
+    "zł": "PLN", "PLN": "PLN",
+    "Kč": "CZK", "CZK": "CZK",
+    "Ft": "HUF", "HUF": "HUF",
+    "lei": "RON", "RON": "RON",
+    "CHF": "CHF",
+    "SEK": "SEK", "NOK": "NOK", "DKK": "DKK",
+}
+
+def default_currency_for_domain(domain: str) -> str:
+    d = domain.split(".")[-1].lower()
+    return {
+        "es":"EUR","fr":"EUR","de":"EUR","it":"EUR","pt":"EUR","nl":"EUR","be":"EUR","ie":"EUR","lt":"EUR","lv":"EUR","ee":"EUR",
+        "pl":"PLN","cz":"CZK","hu":"HUF","ro":"RON",
+        "uk":"GBP","gb":"GBP",
+        "se":"SEK","dk":"DKK","no":"NOK",
+        "ch":"CHF",
+    }.get(d, "EUR")
+
+PRICE_PATTERNS = [
+    re.compile(r'(\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{1,2})?)\s*(€|EUR|\$|USD|£|GBP|zł|PLN|Kč|CZK|Ft|HUF|lei|RON|CHF|SEK|NOK|DKK)', re.I),
+    re.compile(r'(€|EUR|\$|USD|£|GBP|zł|PLN|Kč|CZK|Ft|HUF|lei|RON|CHF|SEK|NOK|DKK)\s*(\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{1,2})?)', re.I),
+]
+
+def parse_price_currency_from_text(text: str, domain_hint: str):
+    t = (text or "").replace("\xa0"," ").strip()
+    if not t: 
+        return "", ""
+    for pat in PRICE_PATTERNS:
+        m = pat.search(t)
+        if m:
+            if len(m.groups()) == 2:
+                a, b = m.group(1), m.group(2)
+                if any(sym in a for sym in ("€","$","£")) or a.upper() in CURRENCY_MAP:
+                    # patrón símbolo primero
+                    curr_raw, val_raw = a, b
+                else:
+                    val_raw, curr_raw = a, b
+            else:
+                continue
+            # normaliza valor: quitar separadores de miles y usar '.' decimal
+            val = val_raw.replace(" ", "").replace("\u202f","").replace(".", "").replace(",", ".")
+            # si tenía formato 1.234,56 y nos hemos cargado miles, arriba ya hicimos replace(".", "")
+            # si tenía 1234.56 no se rompe (ya no tiene '.')
+            try:
+                # validar que es numérico
+                float(val)
+            except Exception:
+                pass
+            curr = CURRENCY_MAP.get(curr_raw, CURRENCY_MAP.get(curr_raw.upper(), ""))
+            if not curr:
+                curr = default_currency_for_domain(domain_hint)
+            return val, curr
+    return "", ""
+
 # ---------- Playwright helpers ----------
 ITEM_ID_RE = re.compile(r'(?:^|/)(?:items)/(\d+)(?:-|$)')
 
@@ -74,11 +133,11 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
 
         seen_ids: set[str] = set()
         stable_rounds = 0
-        for i in range(100):  # más intentos de scroll
+        for i in range(100):
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
             added = 0
             for h in hrefs:
-                if not h:
+                if not h: 
                     continue
                 m = ITEM_ID_RE.search(h)
                 if m:
@@ -88,7 +147,6 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
                         added += 1
             print(f"[pw] scroll {i+1}: total_ids={len(seen_ids)} (+{added})")
 
-            # detener tras 4 rondas sin nuevos
             if added == 0:
                 stable_rounds += 1
             else:
@@ -96,7 +154,6 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
             if stable_rounds >= 4:
                 break
 
-            # scroll y espera a red
             page.evaluate("""
                 const el = document.scrollingElement || document.documentElement || document.body;
                 el.scrollTo(0, el.scrollHeight);
@@ -118,9 +175,6 @@ def _get_meta(page, prop):
         return None
 
 def _parse_attributes_map(page):
-    """
-    Devuelve un dict {label_lower: value_text} para los pares <dt> ... <dd> ...
-    """
     try:
         return page.evaluate("""
 () => {
@@ -142,23 +196,49 @@ def _parse_attributes_map(page):
 
 def _pick_attr(attr_map, variants):
     variants = [v.lower() for v in variants]
-    # match exact
     for k, v in attr_map.items():
-        lk = k.lower()
-        if lk in variants:
+        if k.lower() in variants:
             return v
-    # match startswith/contains
     for k, v in attr_map.items():
         lk = k.lower()
         if any(lk.startswith(pfx) or pfx in lk for pfx in variants):
             return v
     return ""
 
+def _price_from_dom(page, domain_hint: str):
+    """
+    Fallback final: busca nodos con 'price' en data-testid / class o cualquier nodo que contenga símbolo/ISO.
+    Devuelve (valor, moneda) ya normalizados si encuentra algo.
+    """
+    texts = []
+    try:
+        # candidatos obvios
+        texts += page.eval_on_selector_all('[data-testid*="price" i]', "els => els.map(e => (e.textContent||'').trim())")
+    except Exception:
+        pass
+    try:
+        texts += page.eval_on_selector_all('[class*="price" i]', "els => els.map(e => (e.textContent||'').trim())")
+    except Exception:
+        pass
+    # si nada, escanea algunos spans/divs visibles
+    if not any(texts):
+        try:
+            texts += page.eval_on_selector_all('span,div', "els => els.slice(0,400).map(e => (e.textContent||'').trim()).filter(Boolean)")
+        except Exception:
+            pass
+
+    for t in texts:
+        val, curr = parse_price_currency_from_text(t, domain_hint)
+        if val or curr:
+            return val, curr
+    return "", ""
+
 def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
     """
     1) Intenta API JSON con cookies del navegador.
     2) Si no, JSON-LD.
-    3) Si no, metatags OpenGraph/product y atributos del DOM (Marca/Talla/Estado...).
+    3) Si no, metatags OpenGraph/product.
+    4) Si no, DOM (clases/testid con 'price' o cualquier nodo con símbolo/ISO).
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -189,7 +269,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
                             "id": obj.get("id", item_id),
                             "title": obj.get("title",""),
                             "price": price_val,
-                            "currency": currency,
+                            "currency": currency or default_currency_for_domain(domain),
                             "url": url_item,
                             "brand": obj.get("brand_title",""),
                             "size": obj.get("size_title",""),
@@ -212,22 +292,28 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
 
         # 2) JSON-LD si existe
         try:
-            el = page.query_selector('script[type="application/ld+json"]')
-            data = el.text_content() if el else None
-            if data:
+            els = page.query_selector_all('script[type="application/ld+json"]')
+            for el in els:
+                data = el.text_content()
+                if not data:
+                    continue
                 ld = json.loads(data)
                 if isinstance(ld, dict):
-                    title = ld.get("name","") or title
+                    if not title:
+                        title = ld.get("name","") or title
                     offers = ld.get("offers") or {}
                     if isinstance(offers, dict):
-                        price_val = offers.get("price","") or price_val
-                        currency = offers.get("priceCurrency","") or currency
-                    if isinstance(ld.get("brand"), dict):
+                        price_val = price_val or offers.get("price","") or ""
+                        currency  = currency  or offers.get("priceCurrency","") or ""
+                    if isinstance(ld.get("brand"), dict) and not brand:
                         brand = ld["brand"].get("name","") or brand
+                    # si ya tenemos precio/moneda, no seguimos
+                    if price_val and currency:
+                        break
         except Exception:
             pass
 
-        # 3) Metatags (precio, moneda, título)
+        # 3) Metatags
         if not title:
             title = _get_meta(page, "og:title") or page.title()
         if not price_val:
@@ -235,14 +321,23 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
         if not currency:
             currency = _get_meta(page, "product:price:currency") or _get_meta(page, "og:price:currency") or ""
 
-        # 4) Atributos del DOM (Marca/Talla/Estado en varios idiomas)
+        # 4) DOM directo (clases/testid con 'price' o cualquier nodo con símbolo/ISO)
+        if not price_val or not currency:
+            p_dom, c_dom = _price_from_dom(page, domain)
+            price_val = price_val or p_dom
+            currency  = currency  or c_dom
+
+        # 5) Atributos del DOM (Marca/Talla/Estado en varios idiomas)
         attr_map = _parse_attributes_map(page)
         if not brand:
-            brand = _pick_attr(attr_map, ["marca","brand","marque","marke","marca de", "品牌"])
+            brand = _pick_attr(attr_map, ["marca","brand","marque","marke","merk","marca de"])
         if not size:
             size = _pick_attr(attr_map, ["talla","size","taille","größe","maat","taglia","rozmiar"])
         if not status:
             status = _pick_attr(attr_map, ["estado","condition","état","zustand","condición"])
+
+        if not currency:
+            currency = default_currency_for_domain(domain)
 
         browser.close()
         return {
