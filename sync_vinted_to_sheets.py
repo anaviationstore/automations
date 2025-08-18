@@ -14,7 +14,8 @@ GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
 if not (VINTED_USER_ID and SHEET_ID and GOOGLE_SA_JSON):
     raise SystemExit("Faltan variables: VINTED_USER_ID, SHEET_ID o GOOGLE_SA_JSON")
 
-print("CONFIG:", "DOMAIN=", VINTED_DOMAIN, "USER_ID=", VINTED_USER_ID, "SHEET_ID=", SHEET_ID)
+USER_ID_INT = int(VINTED_USER_ID)
+print("CONFIG:", "DOMAIN=", VINTED_DOMAIN, "USER_ID=", USER_ID_INT, "SHEET_ID=", SHEET_ID)
 
 # ---------- Google Sheets ----------
 creds = Credentials.from_service_account_info(json.loads(GOOGLE_SA_JSON),
@@ -30,7 +31,7 @@ HEADERS = ["id", "title", "price", "currency", "url", "brand", "size", "status"]
 
 def write_headers():
     ws.clear()
-    ws.update(range_name="A1:H1", values=[HEADERS])  # evita warning deprecado
+    ws.update(range_name="A1:H1", values=[HEADERS])
 
 def write_rows(items):
     if not items:
@@ -47,12 +48,12 @@ def write_rows(items):
             it.get("size",""),
             it.get("status",""),
         ])
-    needed = len(rows) - (ws.row_count - 1)
-    if needed > 0:
-        ws.add_rows(needed)
+    need = len(rows) - (ws.row_count - 1)
+    if need > 0:
+        ws.add_rows(need)
     ws.update(range_name=f"A2:H{len(rows)+1}", values=rows)
 
-# ---------- Fetch directo con requests (cookies + CSRF) ----------
+# ---------- Fetch directo con requests ----------
 def fetch_items_requests(user_id:int, domain:str):
     sess = requests.Session()
     sess.headers.update({
@@ -63,12 +64,12 @@ def fetch_items_requests(user_id:int, domain:str):
         "X-Requested-With": "XMLHttpRequest",
     })
 
-    # 1) Visitar la home para obtener cookies anti-bot
+    # 1) Visita home para cookies anti-bot
     home = f"https://www.vinted.{domain}/"
     r_home = sess.get(home, timeout=20)
     print("[requests] home status:", r_home.status_code)
 
-    # 2) Extraer token CSRF de cookies si existe y añadir header
+    # 2) Token CSRF (si hay)
     csrf = None
     for k, v in sess.cookies.get_dict().items():
         if "csrf" in k.lower():
@@ -81,14 +82,12 @@ def fetch_items_requests(user_id:int, domain:str):
     results = []
     per_page = 96
 
-    # probamos dos endpoints: catalog/items y users/<id>/items
+    # Probar primero /users/{id}/items (más fiable), luego /catalog/items
     endpoints = [
-        ("catalog", f"https://www.vinted.{domain}/api/v2/catalog/items", {
-            "order": "newest_first", "status": "active", "user_id": user_id, "search_text": ""
-        }),
-        ("user_items", f"https://www.vinted.{domain}/api/v2/users/{user_id}/items", {
-            "order": "newest_first", "status": "active"
-        }),
+        ("user_items", f"https://www.vinted.{domain}/api/v2/users/{user_id}/items",
+         {"order": "newest_first", "status": "active"}),
+        ("catalog",    f"https://www.vinted.{domain}/api/v2/catalog/items",
+         {"order": "newest_first", "status": "active", "user_id": user_id, "search_text": ""}),
     ]
 
     for tag, url, base_params in endpoints:
@@ -99,14 +98,13 @@ def fetch_items_requests(user_id:int, domain:str):
             r = sess.get(url, params=params, timeout=25)
             print(f"[requests {tag}] page={page} status={r.status_code} len={len(r.content)}")
 
-            # Reintento simple si 401/403/5xx
             if r.status_code in (401, 403, 429, 500, 502, 503):
                 time.sleep(1.0)
                 r = sess.get(url, params=params, timeout=25)
                 print(f"[requests {tag}] retry page={page} status={r.status_code}")
 
             if r.status_code != 200:
-                print(f"[requests {tag}] abort: status {r.status_code} snippet: {r.text[:180]}")
+                print(f"[requests {tag}] abort: status {r.status_code} snippet: {r.text[:160]}")
                 break
 
             try:
@@ -120,7 +118,12 @@ def fetch_items_requests(user_id:int, domain:str):
             if not items:
                 break
 
+            # --- Filtrar estrictamente por el usuario ---
             for x in items:
+                uid = x.get("user_id") or (x.get("user") or {}).get("id")
+                if uid != user_id:
+                    continue  # descartamos lo que no sea tuyo
+
                 price_field = x.get("price", "")
                 if isinstance(price_field, dict):
                     price_val = price_field.get("amount", "")
@@ -146,15 +149,15 @@ def fetch_items_requests(user_id:int, domain:str):
 
         if endpoint_results:
             results.extend(endpoint_results)
-            break  # ya tenemos datos con este endpoint, no probamos el otro
+            break  # ya tenemos datos correctos con este endpoint
 
     return results
 
 # ---------- Main ----------
 def main():
     write_headers()
-    items = fetch_items_requests(int(VINTED_USER_ID), VINTED_DOMAIN)
-    print(f"Total artículos: {len(items)}")
+    items = fetch_items_requests(USER_ID_INT, VINTED_DOMAIN)
+    print(f"Total artículos (filtrados por tu user_id): {len(items)}")
     if items:
         write_rows(items)
 
