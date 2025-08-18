@@ -47,10 +47,6 @@ def write_rows(items):
 ITEM_ID_RE = re.compile(r'(?:^|/)(?:items)/(\d+)(?:-|$)')
 
 def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
-    """
-    Abre el perfil, selecciona 'Activos', hace scroll y recolecta /items/<id> (relativos o absolutos).
-    Guarda cookies en playwright_state.json para reusar después.
-    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -62,7 +58,6 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
         )
         page = context.new_page()
 
-        # Normaliza URL y añade filtros visibles en el perfil
         url = profile_url
         if not url.startswith("http"):
             url = f"https://www.vinted.{domain}/member/{url}"
@@ -72,17 +67,14 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
         print("[pw] goto", url)
         page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # Intenta clicar la pestaña "Activos" si existe
         try:
             page.locator("role=button[name=/Activos/i]").first.click(timeout=2_000)
         except Exception:
-            pass  # si no está, ya estamos en activos
+            pass
 
         seen_ids: set[str] = set()
         stable_rounds = 0
-
-        for i in range(80):  # hasta ~80 scrolls
-            # Recoge todos los href (relativos y absolutos)
+        for i in range(80):
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
             added = 0
             for h in hrefs:
@@ -95,16 +87,12 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
                         seen_ids.add(iid)
                         added += 1
             print(f"[pw] scroll {i+1}: total_ids={len(seen_ids)} (+{added})")
-
-            # parar si no hay IDs nuevos en 3 rondas
             if added == 0:
                 stable_rounds += 1
             else:
                 stable_rounds = 0
             if stable_rounds >= 3:
                 break
-
-            # scroll al fondo
             page.evaluate("""
                 const el = document.scrollingElement || document.documentElement || document.body;
                 el.scrollTo(0, el.scrollHeight);
@@ -115,16 +103,25 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
         browser.close()
         return list(seen_ids)
 
+def _get_meta(page, prop):
+    try:
+        return page.eval_on_selector(f'meta[property="{prop}"]', "el => el ? el.content : null")
+    except Exception:
+        return None
+
 def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
     """
-    Intenta API JSON con cookies del navegador. Si no, toma JSON-LD del HTML.
+    1) Intenta API JSON con cookies del navegador.
+    2) Si no hay JSON, intenta JSON-LD.
+    3) Si tampoco, usa metatags OpenGraph/product o <title>.
+    Todo sin lanzar excepciones si falta algún selector.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(storage_state="playwright_state.json")
         req = context.request
 
-        # API JSON (varias rutas)
+        # ---- Intento 1: API JSON
         for url in (
             f"https://www.vinted.{domain}/api/v2/items/{item_id}",
             f"https://www.vinted.{domain}/web/api/v2/items/{item_id}",
@@ -157,14 +154,22 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
                 except Exception:
                     pass
 
-        # Fallback: JSON-LD del HTML del item
+        # ---- Intento 2 y 3: HTML (JSON-LD y metatags)
         page = context.new_page()
         item_url = f"https://www.vinted.{domain}/items/{item_id}"
         page.goto(item_url, wait_until="domcontentloaded", timeout=30_000)
-        data = page.eval_on_selector('script[type="application/ld+json"]', "el => el ? el.textContent : null")
-        title = price_val = currency = brand = size = ""
-        if data:
-            try:
+
+        title = ""
+        price_val = ""
+        currency = ""
+        brand = ""
+        size = ""
+
+        # 2) JSON-LD si existe
+        try:
+            el = page.query_selector('script[type="application/ld+json"]')
+            data = el.text_content() if el else None
+            if data:
                 ld = json.loads(data)
                 if isinstance(ld, dict):
                     title = ld.get("name","") or title
@@ -174,22 +179,30 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
                         currency = offers.get("priceCurrency","") or currency
                     if isinstance(ld.get("brand"), dict):
                         brand = ld["brand"].get("name","") or brand
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+        # 3) Metatags (fallback robusto)
+        if not title:
+            title = _get_meta(page, "og:title") or page.title()
+        if not price_val:
+            price_val = _get_meta(page, "product:price:amount") or _get_meta(page, "og:price:amount") or ""
+        if not currency:
+            currency = _get_meta(page, "product:price:currency") or _get_meta(page, "og:price:currency") or ""
+
         browser.close()
         return {
-            "id": item_id, "title": title, "price": price_val, "currency": currency,
-            "url": item_url, "brand": brand, "size": size, "status": "",
+            "id": item_id, "title": title or "",
+            "price": price_val or "", "currency": currency or "",
+            "url": item_url, "brand": brand or "", "size": size or "", "status": "",
         }
 
 # ---------- Main ----------
 def main():
     write_headers()
 
-    # Perfil/url a usar (evita sombrear variables de entorno)
     profile_url = ENV_PROFILE
     if not profile_url:
-        # Si no hay URL, acepta número y construye la URL
         if ENV_USER_ID.isdigit():
             profile_url = f"https://www.vinted.{VINTED_DOMAIN}/member/{ENV_USER_ID}"
         else:
@@ -197,20 +210,18 @@ def main():
 
     print("CONFIG:", "DOMAIN=", VINTED_DOMAIN, "PROFILE_URL=", profile_url, "SHEET_ID=", SHEET_ID)
 
-    # 1) Recoge IDs navegando el perfil
     ids = collect_item_ids_with_browser(profile_url, VINTED_DOMAIN)
     print(f"[pw] total item ids found: {len(ids)}")
     if not ids:
         print("No hay IDs visibles (¿perfil con artículos ocultos/vacaciones?).")
         return
 
-    # 2) Detalles por cada ID
     items = []
     for i, iid in enumerate(ids, 1):
         items.append(fetch_item_detail_with_browser(iid, VINTED_DOMAIN))
         if i % 10 == 0:
             print(f"[detail] fetched {i}/{len(ids)}")
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     print(f"Total artículos extraídos: {len(items)}")
     if items:
