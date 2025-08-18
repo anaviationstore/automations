@@ -5,12 +5,15 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ---------- Config ----------
-VINTED_DOMAIN = os.getenv("VINTED_DOMAIN", "es")         # es, fr, de, it...
-VINTED_USER_ID = os.getenv("VINTED_USER_ID", "").strip() # si lo pones, debe ser número
+VINTED_DOMAIN = os.getenv("VINTED_DOMAIN", "es").strip()
+VINTED_USER_ID = os.getenv("VINTED_USER_ID", "").strip()       # si lo pones, número
 VINTED_PROFILE_URL = os.getenv("VINTED_PROFILE_URL", "").strip()
 SHEET_ID       = os.getenv("SHEET_ID")
 SHEET_TAB      = os.getenv("SHEET_TAB", "vinted_items")
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
+
+DEBUG_SCHEMA_PAGES = 1   # imprime esquema de la página 1
+DEBUG_ITEMS_TO_SHOW = 2  # cuántos ítems muestra para el esquema
 
 if not (SHEET_ID and GOOGLE_SA_JSON):
     raise SystemExit("Faltan variables: SHEET_ID o GOOGLE_SA_JSON")
@@ -25,7 +28,7 @@ try:
 except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2, cols=8)
 
-HEADERS = ["id", "title", "price", "currency", "url", "brand", "size", "status"]
+HEADERS = ["id","title","price","currency","url","brand","size","status"]
 
 def write_headers():
     ws.clear()
@@ -48,8 +51,8 @@ def detect_domain_from_url(url: str, fallback: str) -> str:
     m = re.search(r"https?://www\.vinted\.([a-z.]+)/", url)
     return m.group(1) if m else fallback
 
-def detect_user_id_from_profile(sess: requests.Session, url: str) -> int | None:
-    # intentos: /member/123456-..., ...-123456, y JSON embebido
+def detect_user_id_from_profile(sess: requests.Session, url: str):
+    # /member/279020986  |  /member/123456-algo  |  ...-123456
     for pat in (r"/member/(\d+)(?:[-/]|$)", r"-([0-9]+)(?:$|[/?])"):
         m = re.search(pat, url)
         if m:
@@ -64,24 +67,54 @@ def detect_user_id_from_profile(sess: requests.Session, url: str) -> int | None:
         m = re.search(p, html)
         if m:
             return int(m.group(1))
-    # último recurso: buscar enlaces a /member/123...
     m = re.search(r'/member/(\d+)-', html)
     return int(m.group(1)) if m else None
 
 def normalize_price_currency(price_field, x):
     if isinstance(price_field, dict):
-        return price_field.get("amount", ""), price_field.get("currency_code", "")
-    return price_field, (x.get("currency") or x.get("currency_code", ""))
+        return price_field.get("amount",""), price_field.get("currency_code","")
+    return price_field, (x.get("currency") or x.get("currency_code",""))
 
-def get_item_user_id(x):
-    uid = x.get("user_id")
-    if uid is None and isinstance(x.get("user"), dict):
-        uid = x["user"].get("id")
-    # homogeneizar a str para comparar
-    return str(uid) if uid is not None else None
+def get_any_seller_id(x):
+    """
+    Devuelve el id del vendedor en string mirando muchos campos posibles.
+    """
+    # campos directos
+    for k in ("user_id","seller_id","owner_id","member_id","profile_id","account_id"):
+        if k in x and x[k] is not None:
+            return str(x[k])
+    # objetos anidados con .id
+    for k in ("user","seller","owner","member","profile","account"):
+        v = x.get(k)
+        if isinstance(v, dict) and v.get("id") is not None:
+            return str(v["id"])
+    return None
+
+def print_schema_preview(items, domain):
+    print("[schema] preview of first items:")
+    for i, x in enumerate(items[:DEBUG_ITEMS_TO_SHOW]):
+        keys = sorted(list(x.keys()))
+        print(f"[schema] item#{i+1} keys:", ", ".join(keys))
+        cand = {
+            "user_id": x.get("user_id"),
+            "seller_id": x.get("seller_id"),
+            "owner_id": x.get("owner_id"),
+            "member_id": x.get("member_id"),
+            "profile_id": x.get("profile_id"),
+            "account_id": x.get("account_id"),
+            "user.id": (x.get("user") or {}).get("id") if isinstance(x.get("user"), dict) else None,
+            "seller.id": (x.get("seller") or {}).get("id") if isinstance(x.get("seller"), dict) else None,
+            "owner.id": (x.get("owner") or {}).get("id") if isinstance(x.get("owner"), dict) else None,
+            "member.id": (x.get("member") or {}).get("id") if isinstance(x.get("member"), dict) else None,
+            "profile.id": (x.get("profile") or {}).get("id") if isinstance(x.get("profile"), dict) else None,
+            "account.id": (x.get("account") or {}).get("id") if isinstance(x.get("account"), dict) else None,
+        }
+        print("[schema] candidate ids:", {k:v for k,v in cand.items() if v is not None})
+        url_item = x.get("url") or (f"https://www.vinted.{domain}{x.get('path')}" if x.get("path") else "")
+        print("[schema] example url:", url_item)
 
 # ---------- Core fetch ----------
-def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
+def fetch_items_requests(user_id:int, domain:str):
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": "Mozilla/5.0",
@@ -91,6 +124,7 @@ def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
         "X-Requested-With": "XMLHttpRequest",
     })
 
+    # cookies anti-bot
     home = f"https://www.vinted.{domain}/"
     r_home = sess.get(home, timeout=20)
     print("[requests] home status:", r_home.status_code)
@@ -103,11 +137,11 @@ def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
     results = []
     per_page = 96
 
-    # 1) users/{id}/items (si está disponible)
+    # 1) users/{id}/items (si existe)
     url_user = f"https://www.vinted.{domain}/api/v2/users/{user_id}/items"
     page = 1
     while True:
-        params = {"order": "newest_first", "status": "active", "page": page, "per_page": per_page}
+        params = {"order":"newest_first","status":"active","page":page,"per_page":per_page}
         r = sess.get(url_user, params=params, timeout=25)
         print(f"[requests user_items] page={page} status={r.status_code} len={len(r.content)}")
         if r.status_code == 404:
@@ -121,6 +155,8 @@ def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
                 break
         data = r.json()
         items = data.get("items", [])
+        if page <= DEBUG_SCHEMA_PAGES and items:
+            print_schema_preview(items, domain)
         print(f"[requests user_items] items this page: {len(items)}")
         if not items:
             break
@@ -139,7 +175,7 @@ def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
     if results:
         return results
 
-    # 2) catalog/items con variantes de parámetro de usuario
+    # 2) catalog/items con variantes y filtro duro
     url_cat = f"https://www.vinted.{domain}/api/v2/catalog/items"
     param_variants = [
         {"user_id": user_id},
@@ -153,32 +189,31 @@ def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
     for variant in param_variants:
         print("[requests catalog] trying variant:", variant)
         page = 1
-        found_for_variant = 0
+        matched_this_variant = 0
         while True:
             params = {
                 "order": "newest_first", "status": "active", "search_text": "",
-                "page": page, "per_page": per_page,
-                **variant
+                "page": page, "per_page": per_page, **variant
             }
             r = sess.get(url_cat, params=params, timeout=25)
             print(f"[requests catalog] page={page} status={r.status_code} len={len(r.content)}")
+            if r.status_code in (401,403,429,500,502,503):
+                time.sleep(0.8)
+                r = sess.get(url_cat, params=params, timeout=25)
+                print(f"[requests catalog] retry page={page} status={r.status_code}")
             if r.status_code != 200:
-                if r.status_code in (401,403,429,500,502,503):
-                    time.sleep(0.8)
-                    r = sess.get(url_cat, params=params, timeout=25)
-                    print(f"[requests catalog] retry page={page} status={r.status_code}")
-                if r.status_code != 200:
-                    break
+                break
 
             data = r.json()
             items = data.get("items", [])
+            if page <= DEBUG_SCHEMA_PAGES and items:
+                print_schema_preview(items, domain)
             print(f"[requests catalog] items this page (raw): {len(items)}")
             if not items:
                 break
 
-            # filtro duro por user_id (comparación como string)
             for x in items:
-                uid = get_item_user_id(x)
+                uid = get_any_seller_id(x)
                 if uid != user_id_str:
                     continue
                 price_val, currency = normalize_price_currency(x.get("price",""), x)
@@ -189,28 +224,26 @@ def fetch_items_requests(user_id:int, domain:str) -> list[dict]:
                     "brand": x.get("brand_title",""), "size": x.get("size_title",""),
                     "status": x.get("status",""),
                 })
-                found_for_variant += 1
+                matched_this_variant += 1
 
             page += 1
-            # Evitar "Page offset invalid"
-            if page > 30:
+            if page > 30:  # evitar 'Page offset invalid'
                 break
             time.sleep(0.25)
 
-        if found_for_variant:
-            print(f"[requests catalog] matched items with variant {variant}: {found_for_variant}")
+        if matched_this_variant:
+            print(f"[requests catalog] matched items with variant {variant}: {matched_this_variant}")
             break
 
-    # dedup por id
-    unique = {}
+    # deduplicar por id
+    uniq = {}
     for it in results:
-        unique[str(it["id"])] = it
-    return list(unique.values())
+        uniq[str(it["id"])] = it
+    return list(uniq.values())
 
 def main():
     write_headers()
 
-    # Determinar user_id/domino correctos
     domain = VINTED_DOMAIN
     user_id = None
     if VINTED_USER_ID.isdigit():
