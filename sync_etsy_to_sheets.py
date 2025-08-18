@@ -66,33 +66,35 @@ LISTING_ID_RE = re.compile(r"/listing/(\d+)")
 RATE_LIMIT_MARKERS = ("robot check", "verify you are a human", "are you a human", "unusual traffic")
 
 def accept_cookies_if_any(page):
-    # Intenta varios banners/casos
-    candidates = [
-        "Accept", "Aceptar", "Allow essential", "Permitir", "Aceptar todo",
-        "Aceptar cookies", "Accept all cookies", "Aceptar todo y continuar"
-    ]
-    for label in candidates:
+    # OneTrust (muy común en Etsy)
+    for sel in ["#onetrust-accept-btn-handler", "button#onetrust-accept-btn-handler"]:
         try:
-            page.locator(f"button:has-text('{label}')").first.click(timeout=1200)
+            page.locator(sel).click(timeout=1200)
             page.wait_for_timeout(250)
-            print("[etsy] cookie banner aceptado:", label)
+            print("[etsy] cookies: OneTrust aceptado")
             return
         except Exception:
             pass
-    # banners por selector
-    for sel in [
-        "form[data-gdpr] button[type=submit]",
-        "div[role='dialog'] button[type=submit]",
-        "div[data-gdpr] button",
-    ]:
+    # Otros banners genéricos
+    texts = ["Accept", "Accept all", "Aceptar", "Aceptar todo", "Permitir"]
+    for t in texts:
+        try:
+            page.locator(f"button:has-text('{t}')").first.click(timeout=1200)
+            page.wait_for_timeout(250)
+            print("[etsy] cookies: botón por texto aceptado:", t)
+            return
+        except Exception:
+            pass
+    # Formularios GDPR varios
+    for sel in ["form[data-gdpr] button[type=submit]", "div[role='dialog'] button[type=submit]"]:
         try:
             page.locator(sel).first.click(timeout=1200)
             page.wait_for_timeout(250)
-            print("[etsy] cookie banner aceptado por selector:", sel)
+            print("[etsy] cookies: formulario/diálogo aceptado")
             return
         except Exception:
             pass
-    print("[etsy] sin banner de cookies o no necesario")
+    print("[etsy] cookies: no apareció banner")
 
 def is_blocked(title: str) -> bool:
     t = (title or "").lower()
@@ -201,123 +203,102 @@ def fallback_from_dom(page) -> Dict[str, Any]:
         data["category"] = cat
     return data
 
+def _normalize(full: str) -> str:
+    if not full: return ""
+    if full.startswith("/"): full = ORIGIN + full
+    elif not full.startswith("http"): full = ORIGIN + "/" + full
+    return full.split("?")[0]
+
+def _gather_listing_links(page) -> list[str]:
+    links = set()
+    # enlaces con data-listing-id o a /listing/
+    for sel in ["a[data-listing-id]", "a[href*='/listing/']",
+                "ul li a[href*='/listing/']", "a.wt-card__link", "a.listing-link"]:
+        try:
+            hrefs = page.eval_on_selector_all(sel, "els => els.map(e => e.href || e.getAttribute('href'))")
+            for h in hrefs or []:
+                h = _normalize(h)
+                if "/listing/" in h: links.add(h)
+        except Exception:
+            pass
+    return sorted(links)
+
 def collect_shop_item_urls(page, shop_url: str) -> (str, str, List[str]):
-    """
-    Recorre las páginas de la tienda y extrae enlaces a /listing/<id>.
-    Incluye más selectores, esperas y logs para depurar por qué sale 0.
-    """
-    urls: set[str] = set()
-    page_num = 1
+    urls = set()
     shop_name = ""
+    variants = [
+        shop_url,
+        shop_url.rstrip("/"),
+        shop_url.rstrip("/") + "/items",
+        shop_url.rstrip("/") + "/search?order=date_desc",
+        shop_url.replace("://www.etsy.com/", "://www.etsy.com/es/"),
+        shop_url.replace("://www.etsy.com/", "://www.etsy.com/es/").rstrip("/") + "/items",
+    ]
+    seen_variants = set()
+    page_num = 1
 
-    while True:
-        url = shop_url if page_num == 1 else (shop_url + (("&" if "?" in shop_url else "?") + f"page={page_num}"))
-        print(f"[etsy] goto page {page_num} -> {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        title = page.title()
-        print(f"[etsy] page {page_num} title:", title)
+    for base in variants:
+        if base in seen_variants: continue
+        seen_variants.add(base)
+        for pn in range(1, 6):  # hasta 5 páginas por variante
+            url = base if pn == 1 else base + (("&" if "?" in base else "?") + f"page={pn}")
+            print(f"[etsy] goto page {pn} -> {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            title = page.title()
+            if title and title.strip().lower() in {"etsy.com", "etsy"}:
+                print("[etsy] aviso: título genérico tras goto (posible redirección o challenge).")
+            if pn == 1:
+                accept_cookies_if_any(page)
+                # nombre tienda
+                for sel in ["h1[data-ui='shop-name']", "h1.wt-text-heading-01", "h1[data-shop-home-title]", "h1"]:
+                    try:
+                        txt = page.locator(sel).first.inner_text().strip()
+                        if txt:
+                            shop_name = txt
+                            break
+                    except Exception:
+                        pass
+                print("[etsy] shop_name:", shop_name or "(no encontrado)")
 
-        if page_num == 1:
-            accept_cookies_if_any(page)
-            # Lee nombre de tienda (varios layouts)
-            for sel in ["h1[data-ui='shop-name']", "h1.wt-text-heading-01", "h1[data-shop-home-title]", "h1"]:
-                try:
-                    txt = page.locator(sel).first.inner_text().strip()
-                    if txt:
-                        shop_name = txt
-                        break
-                except Exception:
-                    pass
-            print("[etsy] shop_name:", shop_name or "(no encontrado)")
+            # Espera rejilla o tarjetas; si no, scrollea un poco para forzar carga
+            try:
+                page.wait_for_selector("a[data-listing-id], a[href*='/listing/']", timeout=5000)
+            except Exception:
+                for _ in range(6):
+                    page.evaluate("window.scrollBy(0, document.body.scrollHeight/3)")
+                    page.wait_for_timeout(400)
 
-        # Espera a que aparezcan tarjetas o la rejilla (best-effort)
-        try:
-            page.wait_for_selector("a[data-listing-id], a[href*='/listing/'], ul li a[href*='/listing/']", timeout=6000)
-        except Exception:
-            pass
+            found = _gather_listing_links(page)
+            print(f"[etsy] page {pn} -> found:{len(found)}")
+            before = len(urls)
+            urls.update(found)
+            added = len(urls) - before
+            print(f"[etsy] added:{added} total:{len(urls)}")
 
-        # Recoge enlaces por varios métodos
-        found = set()
-        try:
-            found |= set(page.eval_on_selector_all(
-                "a[data-listing-id]", "els => els.map(e => e.href || e.getAttribute('href'))"))
-        except Exception:
-            pass
-        try:
-            found |= set(page.eval_on_selector_all(
-                "a[href*='/listing/']", "els => els.map(e => e.href || e.getAttribute('href'))"))
-        except Exception:
-            pass
+            # si no añadió nada en la primera página de esta variante, pasa a la siguiente variante
+            if pn == 1 and added == 0:
+                break
 
-        # Normaliza y cuenta
-        added = 0
-        for h in list(found):
-            if not h:
-                continue
-            full = h if h.startswith("http") else (ORIGIN + h if h.startswith("/") else ORIGIN + "/" + h)
-            full = full.split("?")[0]
-            if "/listing/" in full and full not in urls:
-                urls.add(full)
-                added += 1
+            # detección de “no hay siguiente”: busca botón next
+            has_next = False
+            try:
+                nxt = page.locator("a[aria-label*='Next'], a[aria-label*='Siguiente'], nav ul li a[rel='next']").first
+                has_next = bool(nxt and nxt.is_enabled())
+            except Exception:
+                pass
+            if not has_next:
+                break
 
-        print(f"[etsy] page {page_num} -> anchors:{len(found)} added:{added} total:{len(urls)}")
+            page.wait_for_timeout(700 + int(random.uniform(0, 400)))
 
-        # Si no hay nada en la primera página, prueba variantes comunes de la URL
-        if page_num == 1 and len(urls) == 0:
-            for variant in [
-                shop_url.rstrip("/") + "?ref=seller-platform-mcnav",
-                shop_url.rstrip("/") + "/?ref=seller-platform-mcnav",
-                shop_url.rstrip("/"),
-            ]:
-                if variant == url:
-                    continue
-                print("[etsy] trying variant:", variant)
-                page.goto(variant, wait_until="domcontentloaded", timeout=60_000)
-                try:
-                    page.wait_for_selector("a[data-listing-id], a[href*='/listing/']", timeout=5000)
-                except Exception:
-                    pass
-                try:
-                    vfound = set(page.eval_on_selector_all(
-                        "a[data-listing-id], a[href*='/listing/']",
-                        "els => els.map(e => e.href || e.getAttribute('href'))"))
-                except Exception:
-                    vfound = set()
-                vadded = 0
-                for h in list(vfound):
-                    if not h:
-                        continue
-                    full = h if h.startswith("http") else (ORIGIN + h if h.startswith("/") else ORIGIN + "/" + h)
-                    full = full.split("?")[0]
-                    if "/listing/" in full and full not in urls:
-                        urls.add(full)
-                        vadded += 1
-                print(f"[etsy] variant -> anchors:{len(vfound)} added:{vadded} total:{len(urls)}")
-                if len(urls) > 0:
-                    break
-
-        # ¿existe "siguiente página"?
-        has_next = False
-        try:
-            nxt = page.locator("a[aria-label*='Next'], a[aria-label*='Siguiente'], nav ul li a[rel='next']").first
-            if nxt and nxt.is_enabled():
-                has_next = True
-        except Exception:
-            pass
-
-        if added == 0 and not has_next:
-            break
-
-        page_num += 1
-        if page_num > 50:
-            break
-        page.wait_for_timeout(800 + int(random.uniform(0, 400)))
-
-    return (shop_name or ""), shop_url, sorted(urls)
+    return shop_name or "", shop_url, sorted(urls)
 
 def fetch_item(page, url: str, shop_name: str, shop_url: str) -> Dict[str, Any]:
     for attempt in range(1, 4):
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        title = page.title()
+        if title and title.strip().lower() in {"etsy.com", "etsy"}:
+            print("[etsy] aviso: título genérico tras goto (posible redirección o challenge).")
         if is_blocked(page.title()):
             if attempt < 3:
                 backoff(attempt)
@@ -364,14 +345,27 @@ def run():
     ws = get_ws()
     write_headers(ws)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox","--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ])
         context = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"),
+                        "Chrome/126.0.0.0 Safari/537.36"),
             locale="es-ES",
-            viewport={"width": 1280, "height": 2000},
+            timezone_id="Europe/Madrid",
+            viewport={"width": 1366, "height": 768},
+            device_scale_factor=1.0,
         )
+        # stealth: quitar webdriver, añadir chrome/plugs/languages
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['es-ES','es','en-US','en']});
+        """)
         page = context.new_page()
         shop_name, shop_url, item_urls = collect_shop_item_urls(page, ETSY_PROFILE_URL)
         print(f"Encontrados {len(item_urls)} listings en la tienda '{shop_name or 'N/D'}'.")
