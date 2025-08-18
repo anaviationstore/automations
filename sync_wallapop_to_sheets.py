@@ -1,3 +1,4 @@
+# sync_wallapop_to_sheets.py
 import os
 import json
 import time
@@ -5,20 +6,20 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
+from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
-### ==============================
-### Config por variables de entorno
-### ==============================
-WALLAPOP_PROFILE_URL = os.getenv("WALLAPOP_PROFILE_URL", "").strip()  # p.ej. https://es.wallapop.com/app/user/XXXX
+# ============ Config ============
+WALLAPOP_PROFILE_URL = os.getenv("WALLAPOP_PROFILE_URL", "").strip()  # URL pública del perfil/tienda
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
-SHEET_TAB = os.getenv("SHEET_TAB_WALLAPOP", "wallapop_items").strip()
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS", "").strip()
+SHEET_TAB = os.getenv("SHEET_TAB", "wallapop_items").strip()
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON", "").strip()
 
-# Columnas de salida: añade/quita si quieres
+if not (WALLAPOP_PROFILE_URL and SHEET_ID and GOOGLE_SA_JSON):
+    raise SystemExit("Faltan variables: WALLAPOP_PROFILE_URL, SHEET_ID o GOOGLE_SA_JSON")
+
+# Columnas de salida
 OUTPUT_COLUMNS = [
     "id",
     "title",
@@ -37,75 +38,61 @@ OUTPUT_COLUMNS = [
 ]
 
 
-### ==============================
-### Google Sheets helpers
-### ==============================
+# ============ Google Sheets helpers ============
 def get_sheet():
-    if not GOOGLE_CREDENTIALS_JSON:
-        raise RuntimeError("Falta GOOGLE_CREDENTIALS (JSON de service account).")
+    creds = Credentials.from_service_account_info(
+        json.loads(GOOGLE_SA_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    gc = gspread.authorize(creds)
 
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    gc = gspread.authorize(credentials)
-
-    if not SHEET_ID:
-        raise RuntimeError("Falta SHEET_ID.")
     sh = gc.open_by_key(SHEET_ID)
-
     try:
         ws = sh.worksheet(SHEET_TAB)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=SHEET_TAB, rows="2000", cols=str(len(OUTPUT_COLUMNS) + 5))
 
-    # Encabezados (corrige DeprecationWarning)
+    # Encabezados coherentes
     existing = ws.row_values(1)
     if existing != OUTPUT_COLUMNS:
         ws.clear()
         ws.update(range_name="A1", values=[OUTPUT_COLUMNS])
 
-    # LOG útil
     print(f"Spreadsheet URL: {sh.url}")
     print(f"Worksheet title: {ws.title}")
     return ws
 
 
-def write_rows(ws, rows):
+def write_rows(ws, rows: List[Dict[str, Any]]):
     if not rows:
         return
     values = [[row.get(col, "") for col in OUTPUT_COLUMNS] for row in rows]
 
-    # Calcula la primera fila libre (nº de filas con contenido + 1)
+    # Calcula rango de escritura (append determinista)
     current_values = ws.get_all_values()
     start_row = len(current_values) + 1
     end_row = start_row + len(values) - 1
     end_col = len(OUTPUT_COLUMNS)
 
-    # Rango tipo A{start}:?{end}
-    import string
-    def col_letter(n):
+    def col_letter(n: int) -> str:
         s = ""
         while n:
             n, r = divmod(n - 1, 26)
             s = chr(65 + r) + s
         return s
-    range_name = f"A{start_row}:{col_letter(end_col)}{end_row}"
 
+    range_name = f"A{start_row}:{col_letter(end_col)}{end_row}"
     ws.update(range_name=range_name, values=values, value_input_option="RAW")
     print(f"Escritas {len(values)} filas en rango {range_name}.")
 
 
-### ==============================
-### Scraping Wallapop
-### ==============================
+# ============ Scraping helpers ============
 def normalize_price(raw: Optional[str]) -> (str, str):
-    """ Intenta separar cantidad y divisa; Wallapop suele mostrar '25 €' o '€25' """
+    """Separa cantidad y divisa de textos tipo '25 €' o '€25'."""
     if not raw:
         return "", ""
     txt = raw.strip()
-    # Básico: extrae números y divisa alrededor
     currency = "€" if "€" in txt else ""
-    # Quita todo excepto dígitos y . ,  (luego reemplaza coma por punto)
     digits = []
     for ch in txt:
         if ch.isdigit() or ch in [".", ","]:
@@ -115,20 +102,15 @@ def normalize_price(raw: Optional[str]) -> (str, str):
 
 
 def parse_json_ld(block_text: str) -> Dict[str, Any]:
-    """
-    Devuelve dict con los campos normalizados si el JSON-LD es de tipo Product.
-    Wallapop puede tener múltiples bloques; el script probará varios.
-    """
     out = {}
     try:
         data = json.loads(block_text)
     except json.JSONDecodeError:
         return out
 
-    # A veces es una lista de objetos JSON-LD
     nodes = data if isinstance(data, list) else [data]
     for node in nodes:
-        t = node.get("@type") or node.get("@type".lower())
+        t = node.get("@type") or node.get("@type".lower()) if isinstance(node, dict) else None
         if isinstance(t, list) and "Product" in t:
             product = node
         elif t == "Product":
@@ -138,25 +120,24 @@ def parse_json_ld(block_text: str) -> Dict[str, Any]:
 
         out["title"] = product.get("name", "")
         out["description"] = product.get("description", "")
-        out["image"] = ""
+
         images = product.get("image")
         if isinstance(images, list) and images:
             out["image"] = images[0]
         elif isinstance(images, str):
             out["image"] = images
+        else:
+            out["image"] = ""
 
-        # offers -> price & currency
         offers = product.get("offers") or {}
         if isinstance(offers, list):
             offers = offers[0] if offers else {}
         out["price"] = str(offers.get("price", "")) if offers else ""
         out["currency"] = offers.get("priceCurrency", "") if offers else ""
 
-        # id/url
         out["url"] = product.get("url", "")
         out["id"] = product.get("sku", "") or product.get("productID", "") or ""
 
-        # brand/condition/category
         brand = product.get("brand", "")
         if isinstance(brand, dict):
             out["brand"] = brand.get("name", "")
@@ -164,71 +145,51 @@ def parse_json_ld(block_text: str) -> Dict[str, Any]:
             out["brand"] = brand or ""
 
         out["condition"] = product.get("itemCondition", "")
+
         category = product.get("category", "")
         if isinstance(category, list):
             out["category"] = ", ".join(category)
         else:
             out["category"] = category or ""
 
-        # location (si viene)
         area = product.get("areaServed") or product.get("productionPlace") or ""
         if isinstance(area, dict):
             out["location"] = area.get("name", "")
         else:
             out["location"] = area or ""
 
-        return out  # usamos el primero que encaje
-
+        return out
     return out
 
 
 def extract_with_selectors(page) -> Dict[str, Any]:
-    """
-    Fallback cuando no hay JSON-LD fiable. Los selectores pueden cambiar con el tiempo;
-    aquí usamos clases/atributos comunes y texto.
-    """
     data = {}
 
-    def safe_text(selector: str, timeout=1000) -> str:
+    def safe_text(selector: str, timeout=1200) -> str:
         try:
             el = page.wait_for_selector(selector, timeout=timeout)
             return (el.inner_text() or "").strip()
-        except PlaywrightTimeoutError:
-            return ""
         except Exception:
             return ""
 
-    def safe_attr(selector: str, attr: str, timeout=1000) -> str:
+    def safe_attr(selector: str, attr: str, timeout=1200) -> str:
         try:
             el = page.wait_for_selector(selector, timeout=timeout)
             return (el.get_attribute(attr) or "").strip()
-        except PlaywrightTimeoutError:
-            return ""
         except Exception:
             return ""
 
-    # Título
     data["title"] = safe_text("h1, h1[itemprop='name'], [data-e2e='product-title']")
-
-    # Precio
     raw_price = safe_text("[data-e2e='product-price'], [itemprop='price'], .MoneyAmount__amount, .price")
     price, currency = normalize_price(raw_price)
     data["price"] = price
     data["currency"] = currency
 
-    # Descripción
     data["description"] = safe_text("[data-e2e='product-description'], [itemprop='description'], .description")
-
-    # Imagen principal
-    img = safe_attr("img[itemprop='image'], .swiper img, .product-image img, .Image__img", "src")
-    data["image"] = img
-
-    # Condición / marca / categoría (best-effort)
+    data["image"] = safe_attr("img[itemprop='image'], .swiper img, .product-image img, .Image__img", "src")
     data["condition"] = safe_text("text=Estado") or safe_text("text=Condición")
-    data["brand"] = safe_text("text=Marca")  # muchas fichas no lo tienen
+    data["brand"] = safe_text("text=Marca")
     data["category"] = safe_text("a[href*='/categoria/'], [data-e2e='product-category']")
-
-    # Localidad
     data["location"] = safe_text("[data-e2e='product-location'], .location")
 
     return data
@@ -237,13 +198,16 @@ def extract_with_selectors(page) -> Dict[str, Any]:
 def fetch_item_detail(page, url: str, seller_name: str, seller_url: str) -> Dict[str, Any]:
     page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-    # Intenta JSON-LD primero (como hacíamos con Vinted)
-    jsonld = page.evaluate("""() => {
-        const nodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
-        return nodes.map(n => n.textContent).filter(Boolean);
-    }""")
+    # JSON-LD primero
+    jsonld_blocks = []
+    try:
+        els = page.query_selector_all('script[type="application/ld+json"]')
+        jsonld_blocks = [el.text_content() for el in els if el and el.text_content()]
+    except Exception:
+        pass
+
     parsed = {}
-    for block in jsonld:
+    for block in jsonld_blocks:
         parsed = parse_json_ld(block)
         if parsed:
             break
@@ -251,13 +215,11 @@ def fetch_item_detail(page, url: str, seller_name: str, seller_url: str) -> Dict
     # Fallback por selectores
     if not parsed or not parsed.get("title"):
         sel_parsed = extract_with_selectors(page)
-        # Combina: prioriza JSON-LD si existía, rellena huecos con selectores
         parsed = {**sel_parsed, **parsed} if parsed else sel_parsed
 
-    # ID: si no vino del JSON-LD, intenta desde URL
+    # ID desde URL si no vino
     item_id = parsed.get("id") or ""
     if not item_id:
-        # último segmento de la URL sin query
         try:
             path = url.split("?")[0].rstrip("/").split("/")
             if path:
@@ -265,29 +227,19 @@ def fetch_item_detail(page, url: str, seller_name: str, seller_url: str) -> Dict
         except Exception:
             item_id = ""
 
-    # URL
     parsed["url"] = parsed.get("url") or url
-
-    # Seller
     parsed["seller_name"] = seller_name
     parsed["seller_url"] = seller_url
-
-    # Timestamp
     parsed["timestamp_utc"] = datetime.utcnow().isoformat()
 
-    # Asegura todas las columnas
     normalized = {k: parsed.get(k, "") for k in OUTPUT_COLUMNS}
+    normalized["id"] = item_id
     return normalized
 
 
-def collect_profile_item_urls(page, profile_url: str) -> (str, List[str]):
-    """
-    Abre el perfil del vendedor y hace scroll para cargar todos los productos.
-    Devuelve (seller_name, item_urls).
-    """
+def collect_profile_item_urls(page, profile_url: str) -> (str, str, List[str]):
     page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
 
-    # Nombre del vendedor (best-effort)
     try:
         seller_name = page.evaluate("""() => {
             const el = document.querySelector('h1, [data-e2e="user-name"], .user__name');
@@ -296,22 +248,23 @@ def collect_profile_item_urls(page, profile_url: str) -> (str, List[str]):
     except Exception:
         seller_name = ""
 
-    # Normaliza seller_url
     seller_url = profile_url
 
-    # Scroll infinito
     seen = set()
     stable_rounds = 0
     last_count = 0
 
-    for _ in range(60):  # máx ~60 tandas de scroll
+    for _ in range(60):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(0.7)
 
-        urls = page.evaluate("""() => {
-            const anchors = Array.from(document.querySelectorAll('a[href*="/item/"], a[href*="/product/"], a[href*="/producto/"]'));
-            return anchors.map(a => new URL(a.href, location.origin).href);
-        }""")
+        try:
+            urls = page.evaluate("""() => {
+                const anchors = Array.from(document.querySelectorAll('a[href*="/item/"], a[href*="/product/"], a[href*="/producto/"]'));
+                return anchors.map(a => new URL(a.href, location.origin).href);
+            }""")
+        except Exception:
+            urls = []
 
         for u in urls:
             seen.add(u.split("?")[0])
@@ -329,9 +282,6 @@ def collect_profile_item_urls(page, profile_url: str) -> (str, List[str]):
 
 
 def run():
-    if not WALLAPOP_PROFILE_URL:
-        raise RuntimeError("Falta WALLAPOP_PROFILE_URL (URL del perfil del vendedor en Wallapop).")
-
     ws = get_sheet()
 
     rows_to_write: List[Dict[str, Any]] = []
@@ -341,14 +291,13 @@ def run():
         page = context.new_page()
 
         seller_name, seller_url, item_urls = collect_profile_item_urls(page, WALLAPOP_PROFILE_URL)
-
         print(f"Encontrados {len(item_urls)} items en el perfil.")
+
         for idx, url in enumerate(item_urls, 1):
             try:
                 item_row = fetch_item_detail(page, url, seller_name, seller_url)
                 rows_to_write.append(item_row)
 
-                # Escribe por lotes cada 30
                 if len(rows_to_write) >= 30:
                     write_rows(ws, rows_to_write)
                     rows_to_write = []
