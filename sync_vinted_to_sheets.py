@@ -74,7 +74,7 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
 
         seen_ids: set[str] = set()
         stable_rounds = 0
-        for i in range(80):
+        for i in range(100):  # más intentos de scroll
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
             added = 0
             for h in hrefs:
@@ -87,17 +87,25 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
                         seen_ids.add(iid)
                         added += 1
             print(f"[pw] scroll {i+1}: total_ids={len(seen_ids)} (+{added})")
+
+            # detener tras 4 rondas sin nuevos
             if added == 0:
                 stable_rounds += 1
             else:
                 stable_rounds = 0
-            if stable_rounds >= 3:
+            if stable_rounds >= 4:
                 break
+
+            # scroll y espera a red
             page.evaluate("""
                 const el = document.scrollingElement || document.documentElement || document.body;
                 el.scrollTo(0, el.scrollHeight);
             """)
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(1200)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass
 
         context.storage_state(path="playwright_state.json")
         browser.close()
@@ -109,12 +117,48 @@ def _get_meta(page, prop):
     except Exception:
         return None
 
+def _parse_attributes_map(page):
+    """
+    Devuelve un dict {label_lower: value_text} para los pares <dt> ... <dd> ...
+    """
+    try:
+        return page.evaluate("""
+() => {
+  const out = {};
+  document.querySelectorAll('dt').forEach(dt => {
+    const key = (dt.textContent || '').trim().toLowerCase();
+    const dd = dt.nextElementSibling;
+    if (!key || !dd) return;
+    let val = (dd.textContent || '').trim();
+    const a = dd.querySelector('a'); if (a) val = (a.textContent || '').trim();
+    const span = dd.querySelector('span'); if (span && (!val || val.length < span.textContent.length)) val = (span.textContent || '').trim();
+    out[key] = val;
+  });
+  return out;
+}
+""")
+    except Exception:
+        return {}
+
+def _pick_attr(attr_map, variants):
+    variants = [v.lower() for v in variants]
+    # match exact
+    for k, v in attr_map.items():
+        lk = k.lower()
+        if lk in variants:
+            return v
+    # match startswith/contains
+    for k, v in attr_map.items():
+        lk = k.lower()
+        if any(lk.startswith(pfx) or pfx in lk for pfx in variants):
+            return v
+    return ""
+
 def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
     """
     1) Intenta API JSON con cookies del navegador.
-    2) Si no hay JSON, intenta JSON-LD.
-    3) Si tampoco, usa metatags OpenGraph/product o <title>.
-    Todo sin lanzar excepciones si falta algún selector.
+    2) Si no, JSON-LD.
+    3) Si no, metatags OpenGraph/product y atributos del DOM (Marca/Talla/Estado...).
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -154,7 +198,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
                 except Exception:
                     pass
 
-        # ---- Intento 2 y 3: HTML (JSON-LD y metatags)
+        # ---- Intento 2 y 3: HTML
         page = context.new_page()
         item_url = f"https://www.vinted.{domain}/items/{item_id}"
         page.goto(item_url, wait_until="domcontentloaded", timeout=30_000)
@@ -164,6 +208,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
         currency = ""
         brand = ""
         size = ""
+        status = ""
 
         # 2) JSON-LD si existe
         try:
@@ -182,7 +227,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
         except Exception:
             pass
 
-        # 3) Metatags (fallback robusto)
+        # 3) Metatags (precio, moneda, título)
         if not title:
             title = _get_meta(page, "og:title") or page.title()
         if not price_val:
@@ -190,11 +235,25 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
         if not currency:
             currency = _get_meta(page, "product:price:currency") or _get_meta(page, "og:price:currency") or ""
 
+        # 4) Atributos del DOM (Marca/Talla/Estado en varios idiomas)
+        attr_map = _parse_attributes_map(page)
+        if not brand:
+            brand = _pick_attr(attr_map, ["marca","brand","marque","marke","marca de", "品牌"])
+        if not size:
+            size = _pick_attr(attr_map, ["talla","size","taille","größe","maat","taglia","rozmiar"])
+        if not status:
+            status = _pick_attr(attr_map, ["estado","condition","état","zustand","condición"])
+
         browser.close()
         return {
-            "id": item_id, "title": title or "",
-            "price": price_val or "", "currency": currency or "",
-            "url": item_url, "brand": brand or "", "size": size or "", "status": "",
+            "id": item_id,
+            "title": (title or "").strip(),
+            "price": (price_val or "").strip(),
+            "currency": (currency or "").strip(),
+            "url": item_url,
+            "brand": (brand or "").strip(),
+            "size": (size or "").strip(),
+            "status": (status or "").strip(),
         }
 
 # ---------- Main ----------
