@@ -1,34 +1,34 @@
-name: Sync Etsy to Sheets
+name: Sync Etsy → Sheets
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 7 * * *"  # cada día a las 07:00 UTC
+    - cron: "17 6 * * *"  # diario 06:17 UTC
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      SHEET_ID: ${{ secrets.SHEET_ID }}
-      GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
-      ETSY_PROFILE_URL: ${{ secrets.ETSY_PROFILE_URL }}
-      SHEET_TAB: etsy_items   # nombre de pestaña (no es secret)
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install playwright gspread google-auth
-          playwright install --with-deps chromium
+          pip install gspread google-auth requests
 
       - name: Run sync
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_TAB_ETSY: ${{ secrets.SHEET_TAB_ETSY }}  # opcional
+          ETSY_PROFILE_URL: ${{ secrets.ETSY_PROFILE_URL }}  # o ETSY_SHOP_NAME/ETSY_SHOP_ID
+          ETSY_SHOP_NAME: ${{ secrets.ETSY_SHOP_NAME }}
+          ETSY_SHOP_ID: ${{ secrets.ETSY_SHOP_ID }}
+          ETSY_CLIENT_ID: ${{ secrets.ETSY_CLIENT_ID }}      # keystring
+          ETSY_REFRESH_TOKEN: ${{ secrets.ETSY_REFRESH_TOKEN }}
         run: |
           python sync_etsy_to_sheets.py
