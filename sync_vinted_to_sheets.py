@@ -52,80 +52,101 @@ def write_rows(items):
         ws.add_rows(needed)
     ws.update(range_name=f"A2:H{len(rows)+1}", values=rows)
 
-# ---------- Fetch directo con requests (manteniendo cookies) ----------
+# ---------- Fetch directo con requests (cookies + CSRF) ----------
 def fetch_items_requests(user_id:int, domain:str):
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
         "Referer": f"https://www.vinted.{domain}/",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "X-Requested-With": "XMLHttpRequest",
     })
 
-    # 1) Visita la home para obtener cookies anti-bot
+    # 1) Visitar la home para obtener cookies anti-bot
     home = f"https://www.vinted.{domain}/"
     r_home = sess.get(home, timeout=20)
     print("[requests] home status:", r_home.status_code)
 
-    base = f"https://www.vinted.{domain}/api/v2/catalog/items"
-    page, per_page = 1, 96
+    # 2) Extraer token CSRF de cookies si existe y añadir header
+    csrf = None
+    for k, v in sess.cookies.get_dict().items():
+        if "csrf" in k.lower():
+            csrf = v
+            break
+    if csrf:
+        sess.headers["x-csrf-token"] = csrf
+        print("[requests] csrf token present")
+
     results = []
+    per_page = 96
 
-    while True:
-        params = {
-            "page": page,
-            "per_page": per_page,
-            "order": "newest_first",
-            "status": "active",
-            "user_id": user_id,
-            "search_text": "",
-        }
-        r = sess.get(base, params=params, timeout=25)
-        print(f"[requests] page={page} status={r.status_code} len={len(r.content)}")
-        if r.status_code != 200:
-            # Reintento simple tras pausar (a veces el primer intento necesita refrescar cookie)
-            time.sleep(1.0)
-            r = sess.get(base, params=params, timeout=25)
-            print(f"[requests] retry page={page} status={r.status_code}")
+    # probamos dos endpoints: catalog/items y users/<id>/items
+    endpoints = [
+        ("catalog", f"https://www.vinted.{domain}/api/v2/catalog/items", {
+            "order": "newest_first", "status": "active", "user_id": user_id, "search_text": ""
+        }),
+        ("user_items", f"https://www.vinted.{domain}/api/v2/users/{user_id}/items", {
+            "order": "newest_first", "status": "active"
+        }),
+    ]
 
-        if r.status_code != 200:
-            print("[requests] abort: status", r.status_code, "snippet:", r.text[:180])
-            break
+    for tag, url, base_params in endpoints:
+        page = 1
+        endpoint_results = []
+        while True:
+            params = dict(base_params, page=page, per_page=per_page)
+            r = sess.get(url, params=params, timeout=25)
+            print(f"[requests {tag}] page={page} status={r.status_code} len={len(r.content)}")
 
-        try:
-            data = r.json()
-        except Exception as e:
-            print("[requests] json error:", repr(e), "snippet:", r.text[:180])
-            break
+            # Reintento simple si 401/403/5xx
+            if r.status_code in (401, 403, 429, 500, 502, 503):
+                time.sleep(1.0)
+                r = sess.get(url, params=params, timeout=25)
+                print(f"[requests {tag}] retry page={page} status={r.status_code}")
 
-        items = data.get("items", [])
-        print(f"[requests] items this page: {len(items)}")
-        if not items:
-            break
+            if r.status_code != 200:
+                print(f"[requests {tag}] abort: status {r.status_code} snippet: {r.text[:180]}")
+                break
 
-        for x in items:
-            # price puede ser dict o string
-            price_field = x.get("price", "")
-            if isinstance(price_field, dict):
-                price_val = price_field.get("amount", "")
-                currency = price_field.get("currency_code", "")
-            else:
-                price_val = price_field
-                currency = x.get("currency") or x.get("currency_code", "")
+            try:
+                data = r.json()
+            except Exception as e:
+                print(f"[requests {tag}] json error:", repr(e), "snippet:", r.text[:200])
+                break
 
-            url_item = x.get("url") or (f"https://www.vinted.{domain}{x.get('path')}" if x.get("path") else "")
-            results.append({
-                "id": x.get("id", ""),
-                "title": x.get("title", ""),
-                "price": price_val,
-                "currency": currency,
-                "url": url_item,
-                "brand": x.get("brand_title", ""),
-                "size": x.get("size_title", ""),
-                "status": x.get("status", ""),
-            })
+            items = data.get("items", [])
+            print(f"[requests {tag}] items this page: {len(items)}")
+            if not items:
+                break
 
-        page += 1
-        time.sleep(0.3)
+            for x in items:
+                price_field = x.get("price", "")
+                if isinstance(price_field, dict):
+                    price_val = price_field.get("amount", "")
+                    currency = price_field.get("currency_code", "")
+                else:
+                    price_val = price_field
+                    currency = x.get("currency") or x.get("currency_code", "")
+
+                url_item = x.get("url") or (f"https://www.vinted.{domain}{x.get('path')}" if x.get("path") else "")
+                endpoint_results.append({
+                    "id": x.get("id", ""),
+                    "title": x.get("title", ""),
+                    "price": price_val,
+                    "currency": currency,
+                    "url": url_item,
+                    "brand": x.get("brand_title", ""),
+                    "size": x.get("size_title", ""),
+                    "status": x.get("status", ""),
+                })
+
+            page += 1
+            time.sleep(0.3)
+
+        if endpoint_results:
+            results.extend(endpoint_results)
+            break  # ya tenemos datos con este endpoint, no probamos el otro
 
     return results
 
