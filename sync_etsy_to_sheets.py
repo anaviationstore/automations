@@ -9,7 +9,7 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ========= Config =========
-ETSY_SHOP_URL  = os.getenv("ETSY_SHOP_URL", "").strip()   # ej: https://www.etsy.com/shop/TuTienda
+ETSY_SHOP_URL  = os.getenv("ETSY_PROFILE_URL", "").strip()   # ej: https://www.etsy.com/shop/TuTienda
 SHEET_ID       = os.getenv("SHEET_ID", "").strip()
 SHEET_TAB      = os.getenv("SHEET_TAB", "etsy_items").strip()
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON", "").strip()
