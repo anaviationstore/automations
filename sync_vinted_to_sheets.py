@@ -9,7 +9,7 @@ VINTED_DOMAIN = os.getenv("VINTED_DOMAIN", "es").strip()
 ENV_USER_ID   = os.getenv("VINTED_USER_ID", "").strip()             # opcional
 ENV_PROFILE   = os.getenv("VINTED_PROFILE_URL", "").strip()         # ej: https://www.vinted.es/member/279020986
 SHEET_ID      = os.getenv("SHEET_ID")
-SHEET_TAB     = os.getenv("SHEET_TAB", "vinted_items")
+SHEET_TAB     = os.getenv("SHEET_TAB_VINTED", "vinted_items")
 GOOGLE_SA_JSON= os.getenv("GOOGLE_SA_JSON")
 
 if not (SHEET_ID and GOOGLE_SA_JSON):
