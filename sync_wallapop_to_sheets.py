@@ -58,20 +58,41 @@ def get_sheet():
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=SHEET_TAB, rows="2000", cols=str(len(OUTPUT_COLUMNS) + 5))
 
-    # Encabezados
+    # Encabezados (corrige DeprecationWarning)
     existing = ws.row_values(1)
     if existing != OUTPUT_COLUMNS:
-        ws.resize(rows=2)  # limpia si cambia la estructura
-        ws.update("A1", [OUTPUT_COLUMNS])
+        ws.clear()
+        ws.update(range_name="A1", values=[OUTPUT_COLUMNS])
 
+    # LOG útil
+    print(f"Spreadsheet URL: {sh.url}")
+    print(f"Worksheet title: {ws.title}")
     return ws
 
 
-def write_rows(ws, rows: List[Dict[str, Any]]):
+def write_rows(ws, rows):
     if not rows:
         return
     values = [[row.get(col, "") for col in OUTPUT_COLUMNS] for row in rows]
-    ws.append_rows(values, value_input_option="RAW")
+
+    # Calcula la primera fila libre (nº de filas con contenido + 1)
+    current_values = ws.get_all_values()
+    start_row = len(current_values) + 1
+    end_row = start_row + len(values) - 1
+    end_col = len(OUTPUT_COLUMNS)
+
+    # Rango tipo A{start}:?{end}
+    import string
+    def col_letter(n):
+        s = ""
+        while n:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+    range_name = f"A{start_row}:{col_letter(end_col)}{end_row}"
+
+    ws.update(range_name=range_name, values=values, value_input_option="RAW")
+    print(f"Escritas {len(values)} filas en rango {range_name}.")
 
 
 ### ==============================
