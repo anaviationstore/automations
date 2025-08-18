@@ -1,23 +1,32 @@
 # sync_vinted_to_sheets.py
 import os, re, json, time
+from urllib.parse import urlparse
+
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
 
 # ---------- Config ----------
-VINTED_DOMAIN = os.getenv("VINTED_DOMAIN", "es").strip()
-ENV_USER_ID   = os.getenv("VINTED_USER_ID", "").strip()             # opcional
-ENV_PROFILE   = os.getenv("VINTED_PROFILE_URL", "").strip()         # ej: https://www.vinted.es/member/279020986
+ENV_PROFILE   = os.getenv("VINTED_PROFILE_URL", "").strip()   # ej: https://www.vinted.es/member/279020986
 SHEET_ID      = os.getenv("SHEET_ID")
-SHEET_TAB     = os.getenv("SHEET_TAB_VINTED", "vinted_items")
+SHEET_TAB     = os.getenv("SHEET_TAB", "vinted_items")
 GOOGLE_SA_JSON= os.getenv("GOOGLE_SA_JSON")
 
-if not (SHEET_ID and GOOGLE_SA_JSON):
-    raise SystemExit("Faltan variables: SHEET_ID o GOOGLE_SA_JSON")
+if not (SHEET_ID and GOOGLE_SA_JSON and ENV_PROFILE):
+    raise SystemExit("Faltan variables: SHEET_ID, GOOGLE_SA_JSON o VINTED_PROFILE_URL")
+
+# Derivar origen/dominio a partir de la URL del perfil
+parsed = urlparse(ENV_PROFILE)
+if not (parsed.scheme and parsed.netloc):
+    raise SystemExit("VINTED_PROFILE_URL debe ser una URL completa, p. ej. https://www.vinted.es/member/279020986")
+ORIGIN = f"{parsed.scheme}://{parsed.netloc}"   # p.ej. https://www.vinted.es
+DOMAIN_HINT = parsed.netloc                      # para moneda (toma TLD de aquí)
 
 # ---------- Google Sheets ----------
-creds = Credentials.from_service_account_info(json.loads(GOOGLE_SA_JSON),
-                                              scopes=["https://www.googleapis.com/auth/spreadsheets"])
+creds = Credentials.from_service_account_info(
+    json.loads(GOOGLE_SA_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
 try:
@@ -57,7 +66,8 @@ CURRENCY_MAP = {
 }
 
 def default_currency_for_domain(domain: str) -> str:
-    d = domain.split(".")[-1].lower()
+    # acepta host completo o solo TLD
+    d = (domain or "").split(".")[-1].lower()
     return {
         "es":"EUR","fr":"EUR","de":"EUR","it":"EUR","pt":"EUR","nl":"EUR","be":"EUR","ie":"EUR","lt":"EUR","lv":"EUR","ee":"EUR",
         "pl":"PLN","cz":"CZK","hu":"HUF","ro":"RON",
@@ -73,7 +83,7 @@ PRICE_PATTERNS = [
 
 def parse_price_currency_from_text(text: str, domain_hint: str):
     t = (text or "").replace("\xa0"," ").strip()
-    if not t: 
+    if not t:
         return "", ""
     for pat in PRICE_PATTERNS:
         m = pat.search(t)
@@ -81,18 +91,13 @@ def parse_price_currency_from_text(text: str, domain_hint: str):
             if len(m.groups()) == 2:
                 a, b = m.group(1), m.group(2)
                 if any(sym in a for sym in ("€","$","£")) or a.upper() in CURRENCY_MAP:
-                    # patrón símbolo primero
                     curr_raw, val_raw = a, b
                 else:
                     val_raw, curr_raw = a, b
             else:
                 continue
-            # normaliza valor: quitar separadores de miles y usar '.' decimal
             val = val_raw.replace(" ", "").replace("\u202f","").replace(".", "").replace(",", ".")
-            # si tenía formato 1.234,56 y nos hemos cargado miles, arriba ya hicimos replace(".", "")
-            # si tenía 1234.56 no se rompe (ya no tiene '.')
             try:
-                # validar que es numérico
                 float(val)
             except Exception:
                 pass
@@ -105,7 +110,7 @@ def parse_price_currency_from_text(text: str, domain_hint: str):
 # ---------- Playwright helpers ----------
 ITEM_ID_RE = re.compile(r'(?:^|/)(?:items)/(\d+)(?:-|$)')
 
-def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
+def collect_item_ids_with_browser(profile_url: str) -> list[str]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -118,8 +123,6 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
         page = context.new_page()
 
         url = profile_url
-        if not url.startswith("http"):
-            url = f"https://www.vinted.{domain}/member/{url}"
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}status=active&order=newest_first"
 
@@ -137,7 +140,7 @@ def collect_item_ids_with_browser(profile_url: str, domain: str) -> list[str]:
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
             added = 0
             for h in hrefs:
-                if not h: 
+                if not h:
                     continue
                 m = ITEM_ID_RE.search(h)
                 if m:
@@ -206,13 +209,8 @@ def _pick_attr(attr_map, variants):
     return ""
 
 def _price_from_dom(page, domain_hint: str):
-    """
-    Fallback final: busca nodos con 'price' en data-testid / class o cualquier nodo que contenga símbolo/ISO.
-    Devuelve (valor, moneda) ya normalizados si encuentra algo.
-    """
     texts = []
     try:
-        # candidatos obvios
         texts += page.eval_on_selector_all('[data-testid*="price" i]', "els => els.map(e => (e.textContent||'').trim())")
     except Exception:
         pass
@@ -220,7 +218,6 @@ def _price_from_dom(page, domain_hint: str):
         texts += page.eval_on_selector_all('[class*="price" i]', "els => els.map(e => (e.textContent||'').trim())")
     except Exception:
         pass
-    # si nada, escanea algunos spans/divs visibles
     if not any(texts):
         try:
             texts += page.eval_on_selector_all('span,div', "els => els.slice(0,400).map(e => (e.textContent||'').trim()).filter(Boolean)")
@@ -233,7 +230,7 @@ def _price_from_dom(page, domain_hint: str):
             return val, curr
     return "", ""
 
-def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
+def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) -> dict:
     """
     1) Intenta API JSON con cookies del navegador.
     2) Si no, JSON-LD.
@@ -247,8 +244,8 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
 
         # ---- Intento 1: API JSON
         for url in (
-            f"https://www.vinted.{domain}/api/v2/items/{item_id}",
-            f"https://www.vinted.{domain}/web/api/v2/items/{item_id}",
+            f"{origin}/api/v2/items/{item_id}",
+            f"{origin}/web/api/v2/items/{item_id}",
         ):
             r = req.get(url, timeout=30_000)
             if r.ok:
@@ -263,13 +260,13 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
                         else:
                             price_val = price_field
                             currency = obj.get("currency") or obj.get("currency_code", "")
-                        url_item = obj.get("url") or f"https://www.vinted.{domain}/items/{item_id}"
+                        url_item = obj.get("url") or f"{origin}/items/{item_id}"
                         browser.close()
                         return {
                             "id": obj.get("id", item_id),
                             "title": obj.get("title",""),
                             "price": price_val,
-                            "currency": currency or default_currency_for_domain(domain),
+                            "currency": currency or default_currency_for_domain(domain_hint),
                             "url": url_item,
                             "brand": obj.get("brand_title",""),
                             "size": obj.get("size_title",""),
@@ -280,7 +277,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
 
         # ---- Intento 2 y 3: HTML
         page = context.new_page()
-        item_url = f"https://www.vinted.{domain}/items/{item_id}"
+        item_url = f"{origin}/items/{item_id}"
         page.goto(item_url, wait_until="domcontentloaded", timeout=30_000)
 
         title = ""
@@ -307,7 +304,6 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
                         currency  = currency  or offers.get("priceCurrency","") or ""
                     if isinstance(ld.get("brand"), dict) and not brand:
                         brand = ld["brand"].get("name","") or brand
-                    # si ya tenemos precio/moneda, no seguimos
                     if price_val and currency:
                         break
         except Exception:
@@ -323,7 +319,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
 
         # 4) DOM directo (clases/testid con 'price' o cualquier nodo con símbolo/ISO)
         if not price_val or not currency:
-            p_dom, c_dom = _price_from_dom(page, domain)
+            p_dom, c_dom = _price_from_dom(page, domain_hint)
             price_val = price_val or p_dom
             currency  = currency  or c_dom
 
@@ -337,7 +333,7 @@ def fetch_item_detail_with_browser(item_id: str, domain: str) -> dict:
             status = _pick_attr(attr_map, ["estado","condition","état","zustand","condición"])
 
         if not currency:
-            currency = default_currency_for_domain(domain)
+            currency = default_currency_for_domain(domain_hint)
 
         browser.close()
         return {
@@ -356,15 +352,9 @@ def main():
     write_headers()
 
     profile_url = ENV_PROFILE
-    if not profile_url:
-        if ENV_USER_ID.isdigit():
-            profile_url = f"https://www.vinted.{VINTED_DOMAIN}/member/{ENV_USER_ID}"
-        else:
-            raise SystemExit("Necesito VINTED_PROFILE_URL o VINTED_USER_ID numérico.")
+    print("CONFIG:", "ORIGIN=", ORIGIN, "PROFILE_URL=", profile_url, "SHEET_ID=", SHEET_ID)
 
-    print("CONFIG:", "DOMAIN=", VINTED_DOMAIN, "PROFILE_URL=", profile_url, "SHEET_ID=", SHEET_ID)
-
-    ids = collect_item_ids_with_browser(profile_url, VINTED_DOMAIN)
+    ids = collect_item_ids_with_browser(profile_url)
     print(f"[pw] total item ids found: {len(ids)}")
     if not ids:
         print("No hay IDs visibles (¿perfil con artículos ocultos/vacaciones?).")
@@ -372,7 +362,7 @@ def main():
 
     items = []
     for i, iid in enumerate(ids, 1):
-        items.append(fetch_item_detail_with_browser(iid, VINTED_DOMAIN))
+        items.append(fetch_item_detail_with_browser(iid, ORIGIN, DOMAIN_HINT))
         if i % 10 == 0:
             print(f"[detail] fetched {i}/{len(ids)}")
         time.sleep(0.05)
