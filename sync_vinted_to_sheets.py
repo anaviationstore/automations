@@ -1,17 +1,15 @@
 # sync_vinted_to_sheets.py
 import os, json, time
-from datetime import datetime
-import urllib.parse, urllib.request, ssl
-
+import urllib.request, ssl
 import gspread
 from google.oauth2.service_account import Credentials
 
 # -------- Config desde secrets/entorno --------
-VINTED_DOMAIN = os.getenv("VINTED_DOMAIN", "es")      # ej: es, fr, de, it, nl...
-VINTED_USER_ID = os.getenv("VINTED_USER_ID")          # número del perfil: https://www.vinted.es/member/123456-usuario
+VINTED_DOMAIN = os.getenv("VINTED_DOMAIN", "es")      # ej: es, fr, de, it...
+VINTED_USER_ID = os.getenv("VINTED_USER_ID")          # número en tu URL: https://www.vinted.es/member/123456-usuario
 SHEET_ID       = os.getenv("SHEET_ID")                # ID del Google Sheet
 SHEET_TAB      = os.getenv("SHEET_TAB", "vinted_items")
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")          # contenido JSON (string entero)
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")          # contenido JSON (string)
 
 if not (VINTED_USER_ID and SHEET_ID and GOOGLE_SA_JSON):
     raise SystemExit("Faltan variables: VINTED_USER_ID, SHEET_ID o GOOGLE_SA_JSON")
@@ -36,7 +34,6 @@ except gspread.exceptions.WorksheetNotFound:
 HEADERS = ["id","title","price","currency","url","brand","size","status"]
 
 def write_headers():
-    # Limpia desde la fila 2 y deja las cabeceras
     ws.clear()
     ws.update("A1:H1", [HEADERS])
 
@@ -55,135 +52,57 @@ def write_rows(items):
             it.get("size",""),
             it.get("status",""),
         ])
-    ws.add_rows(max(0, len(rows) - (ws.row_count - 1)))
+    # Asegura filas suficientes
+    extra = max(0, len(rows) - (ws.row_count - 1))
+    if extra:
+        ws.add_rows(extra)
     ws.update(f"A2:H{len(rows)+1}", rows)
 
-# -------- Fetchers --------
-# Desactiva verificación SSL en algunos runners (evita errores de cert en urllib)
-ssl._create_default_https_context = ssl._create_unverified_context
-
-def http_json(url):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://www.vinted.{VINTED_DOMAIN}/",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=25) as r:
-        txt = r.read().decode("utf-8")
-        return json.loads(txt)
-
-def fetch_with_wrapper(user_id: int, domain: str):
-    """Intenta usar la librería no-oficial si está disponible."""
+# -------- Fetch por wrapper (con search_url) --------
+def fetch_items_via_wrapper(user_id:int, domain:str):
+    """
+    Usa el cliente oficial del wrapper 'vinted' con una URL de búsqueda
+    que filtra por user_id. El wrapper se encarga de cookies/tokens.
+    """
     try:
         from vinted import Vinted
         v = Vinted(domain=domain)
+        search_url = f"https://www.vinted.{domain}/catalog?user_id={user_id}&status=active&order=newest_first"
         results = []
         page, per_page = 1, 100
         while True:
-            # Muchos wrappers aceptan estos argumentos
-            resp = v.search(user_id=user_id, page=page, per_page=per_page, order="newest_first")
-            items = getattr(resp, "items", []) or []
+            # IMPORTANTE: este wrapper acepta search_url, page y per_page
+            resp = v.search(search_url=search_url, page=page, per_page=per_page, order="newest_first")
+            items = getattr(resp, "items", resp) or []
             print(f"[wrapper] page={page} items={len(items)}")
             if not items:
                 break
             for x in items:
+                # El wrapper devuelve objetos; usamos getattr para no romper si falta algo
                 results.append({
                     "id": getattr(x, "id", ""),
                     "title": getattr(x, "title", ""),
-                    "price": getattr(x, "price", ""),
-                    "currency": getattr(x, "currency", ""),
+                    # Algunos wrappers devuelven price como número/str y currency aparte
+                    "price": getattr(x, "price", "") or getattr(x, "price_numeric", ""),
+                    "currency": getattr(x, "currency", "") or getattr(x, "currency_code", ""),
                     "url": getattr(x, "url", ""),
                     "brand": getattr(x, "brand_title", ""),
                     "size": getattr(x, "size_title", ""),
                     "status": getattr(x, "status", ""),
                 })
             page += 1
-            time.sleep(0.5)
+            time.sleep(0.4)
         return results
     except Exception as e:
         print("[wrapper] error:", repr(e))
-        return None
-
-def fetch_with_fallback(user_id: int, domain: str):
-    """Usa endpoints públicos no documentados como respaldo."""
-    results = []
-
-    # Endpoint A: /api/v2/users/<id>/items
-    try:
-        page, per_page = 1, 100
-        while True:
-            url = f"https://www.vinted.{domain}/api/v2/users/{user_id}/items?status=active&order=newest_first&page={page}&per_page={per_page}"
-            data = http_json(url)
-            items = data.get("items", [])
-            print(f"[fallback A] page={page} items={len(items)}")
-            if not items:
-                break
-            for x in items:
-                price = x.get("price", {})
-                results.append({
-                    "id": x.get("id"),
-                    "title": x.get("title"),
-                    "price": price.get("amount", ""),
-                    "currency": price.get("currency_code", ""),
-                    "url": x.get("url"),
-                    "brand": x.get("brand_title", ""),
-                    "size": x.get("size_title", ""),
-                    "status": x.get("status", ""),
-                })
-            page += 1
-            time.sleep(0.4)
-        if results:
-            return results
-    except Exception as e:
-        print("[fallback A] error:", repr(e))
-
-    # Endpoint B: /api/v2/catalog/items?user_id=...
-    try:
-        page, per_page = 1, 100
-        while True:
-            url = f"https://www.vinted.{domain}/api/v2/catalog/items?user_id={user_id}&order=newest_first&page={page}&per_page={per_page}"
-            data = http_json(url)
-            items = data.get("items", [])
-            print(f"[fallback B] page={page} items={len(items)}")
-            if not items:
-                break
-            for x in items:
-                price = x.get("price", {})
-                results.append({
-                    "id": x.get("id"),
-                    "title": x.get("title"),
-                    "price": (price.get("amount") if isinstance(price, dict) else price),
-                    "currency": (price.get("currency_code") if isinstance(price, dict) else ""),
-                    "url": x.get("url"),
-                    "brand": x.get("brand_title", ""),
-                    "size": x.get("size_title", ""),
-                    "status": x.get("status", ""),
-                })
-            page += 1
-            time.sleep(0.4)
-    except Exception as e:
-        print("[fallback B] error:", repr(e))
-
-    return results
+        return []
 
 # -------- Main --------
 def main():
     write_headers()
-
-    # 1º intento: wrapper
-    items = fetch_with_wrapper(int(VINTED_USER_ID), VINTED_DOMAIN)
-
-    # Respaldo: endpoints
-    if not items:
-        items = fetch_with_fallback(int(VINTED_USER_ID), VINTED_DOMAIN)
-
-    total = len(items) if items else 0
-    print(f"Total artículos: {total}")
-
-    if total:
+    items = fetch_items_via_wrapper(int(VINTED_USER_ID), VINTED_DOMAIN)
+    print(f"Total artículos: {len(items)}")
+    if items:
         write_rows(items)
 
 if __name__ == "__main__":
