@@ -52,61 +52,84 @@ def write_rows(items):
         ws.add_rows(needed)
     ws.update(range_name=f"A2:H{len(rows)+1}", values=rows)
 
-# ---------- Fetch con wrapper (URL como argumento posicional) ----------
+# ---------- Normalizador de respuestas del wrapper ----------
+def extract_items_from_resp(resp):
+    """
+    El wrapper 'vinted' a veces devuelve:
+    - lista de objetos (con atributos .id, .title, etc.)
+    - objeto con atributo .items (lista)
+    - dict con clave 'items' (lista)
+    - lista de dicts
+    Esta función devuelve siempre una lista de "records" dict.
+    """
+    # 1) dict con clave 'items'
+    if isinstance(resp, dict):
+        data_items = resp.get("items", [])
+    else:
+        # 2) objeto con atributo .items que NO sea callable (lista)
+        attr = getattr(resp, "items", None)
+        if attr is not None and not callable(attr):
+            data_items = attr
+        else:
+            # 3) lista directa (de objetos o dicts)
+            data_items = resp if isinstance(resp, list) else []
+
+    norm = []
+    for x in data_items:
+        if isinstance(x, dict):
+            price_field = x.get("price", "")
+            if isinstance(price_field, dict):
+                price_val = price_field.get("amount", "")
+                currency = price_field.get("currency_code", "")
+            else:
+                price_val = price_field
+                currency = x.get("currency") or x.get("currency_code", "")
+
+            url_item = x.get("url") or (f"https://www.vinted.{VINTED_DOMAIN}{x.get('path')}" if x.get("path") else "")
+
+            norm.append({
+                "id": x.get("id", ""),
+                "title": x.get("title", ""),
+                "price": price_val,
+                "currency": currency,
+                "url": url_item,
+                "brand": x.get("brand_title", ""),
+                "size": x.get("size_title", ""),
+                "status": x.get("status", ""),
+            })
+        else:
+            # objeto del wrapper
+            norm.append({
+                "id": getattr(x, "id", ""),
+                "title": getattr(x, "title", ""),
+                "price": getattr(x, "price", "") or getattr(x, "price_numeric", ""),
+                "currency": getattr(x, "currency", "") or getattr(x, "currency_code", ""),
+                "url": getattr(x, "url", ""),
+                "brand": getattr(x, "brand_title", ""),
+                "size": getattr(x, "size_title", ""),
+                "status": getattr(x, "status", ""),
+            })
+    return norm
+
+# ---------- Fetch con wrapper (pasando URL como argumento posicional) ----------
 def fetch_items(user_id:int, domain:str):
-    """
-    Usa el wrapper 'vinted' pasando una URL de búsqueda como PRIMER argumento.
-    Paginamos añadiendo &page=&per_page= a la URL.
-    """
     from vinted import Vinted
     v = Vinted(domain=domain)
 
     base_url = f"https://www.vinted.{domain}/catalog?user_id={user_id}&status=active&order=newest_first"
-    page, per_page = 1, 100
+    page, per_page = 1, 96  # el wrapper usa 96 por defecto; mantenemos ese valor
     results = []
 
     while True:
         url = f"{base_url}&page={page}&per_page={per_page}"
-        # OJO: el wrapper espera el primer parámetro posicional (sin nombre)
-        resp = v.search(url)
-        # resp puede ser lista de objetos, o un objeto con .items
-        items = getattr(resp, "items", None)
-        if items is None:
-            items = resp if isinstance(resp, list) else (resp.get("items", []) if isinstance(resp, dict) else [])
-        print(f"[wrapper-url] page={page} items={len(items)}")
-        if not items:
+        resp = v.search(url)  # PRIMER argumento posicional, sin kwargs
+        items_list = extract_items_from_resp(resp)
+        print(f"[wrapper-url] page={page} items={len(items_list)}")
+        if not items_list:
             break
-
-        for x in items:
-            if isinstance(x, dict):
-                price = x.get("price", {})
-                price_val = price.get("amount", "") if isinstance(price, dict) else price
-                currency = price.get("currency_code", "") if isinstance(price, dict) else (x.get("currency") or "")
-                url_item = x.get("url") or (f"https://www.vinted.{domain}{x.get('path')}" if x.get("path") else "")
-                results.append({
-                    "id": x.get("id", ""),
-                    "title": x.get("title", ""),
-                    "price": price_val,
-                    "currency": currency,
-                    "url": url_item,
-                    "brand": x.get("brand_title", ""),
-                    "size": x.get("size_title", ""),
-                    "status": x.get("status", ""),
-                })
-            else:
-                # objeto del wrapper
-                results.append({
-                    "id": getattr(x, "id", ""),
-                    "title": getattr(x, "title", ""),
-                    "price": getattr(x, "price", "") or getattr(x, "price_numeric", ""),
-                    "currency": getattr(x, "currency", "") or getattr(x, "currency_code", ""),
-                    "url": getattr(x, "url", ""),
-                    "brand": getattr(x, "brand_title", ""),
-                    "size": getattr(x, "size_title", ""),
-                    "status": getattr(x, "status", ""),
-                })
+        results.extend(items_list)
         page += 1
-        time.sleep(0.4)
+        time.sleep(0.3)
 
     return results
 
