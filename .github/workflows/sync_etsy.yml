@@ -11,7 +11,7 @@ jobs:
     env:
       SHEET_ID: ${{ secrets.SHEET_ID }}
       GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
-      ETSY_SHOP_URL: ${{ secrets.ETSY_SHOP_URL }}
+      ETSY_PROFILE_URL: ${{ secrets.ETSY_PROFILE_URL }}
       SHEET_TAB: etsy_items   # nombre de pestaña (no es secret)
 
     steps:
