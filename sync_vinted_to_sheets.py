@@ -1,5 +1,5 @@
 # sync_vinted_to_sheets.py
-import os, re, json, time
+import os, re, json, time, random
 from urllib.parse import urlparse
 
 import gspread
@@ -7,10 +7,10 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
 
 # ---------- Config ----------
-ENV_PROFILE   = os.getenv("VINTED_PROFILE_URL", "").strip()   # ej: https://www.vinted.es/member/279020986
-SHEET_ID      = os.getenv("SHEET_ID")
-SHEET_TAB     = os.getenv("SHEET_TAB", "vinted_items")
-GOOGLE_SA_JSON= os.getenv("GOOGLE_SA_JSON")
+ENV_PROFILE    = os.getenv("VINTED_PROFILE_URL", "").strip()   # ej: https://www.vinted.es/member/279020986
+SHEET_ID       = os.getenv("SHEET_ID")
+SHEET_TAB      = os.getenv("SHEET_TAB", "vinted_items")
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
 
 if not (SHEET_ID and GOOGLE_SA_JSON and ENV_PROFILE):
     raise SystemExit("Faltan variables: SHEET_ID, GOOGLE_SA_JSON o VINTED_PROFILE_URL")
@@ -106,6 +106,34 @@ def parse_price_currency_from_text(text: str, domain_hint: str):
                 curr = default_currency_for_domain(domain_hint)
             return val, curr
     return "", ""
+
+# ---------- Rate limit helpers ----------
+RATE_LIMIT_STRINGS = ("rate limited", "too many requests")
+
+def is_rate_limited_title(txt: str) -> bool:
+    t = (txt or "").lower()
+    return any(s in t for s in RATE_LIMIT_STRINGS)
+
+def backoff_sleep(attempt: int):
+    # 1º intento ~5–7s, 2º ~10–12s, 3º ~20–22s (cap 25s)
+    base = min(25, 5 * (2 ** (attempt - 1)))
+    time.sleep(base + random.uniform(0, 2))
+
+def title_from_dom(page) -> str:
+    for sel in [
+        "h1[data-testid='item-title']",
+        "h1[itemprop='name']",
+        "h1"
+    ]:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                t = (el.text_content() or "").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+    return ""
 
 # ---------- Playwright helpers ----------
 ITEM_ID_RE = re.compile(r'(?:^|/)(?:items)/(\d+)(?:-|$)')
@@ -215,7 +243,7 @@ def _price_from_dom(page, domain_hint: str):
     except Exception:
         pass
     try:
-        texts += page.eval_on_selector_all('[class*="price" i]', "els => els.map(e => (e.textContent||'').trim())")
+        texts += page.eval_on_selector_all('[class*=\"price\" i]', "els => els.map(e => (e.textContent||'').trim())")
     except Exception:
         pass
     if not any(texts):
@@ -236,6 +264,7 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
     2) Si no, JSON-LD.
     3) Si no, metatags OpenGraph/product.
     4) Si no, DOM (clases/testid con 'price' o cualquier nodo con símbolo/ISO).
+    Con reintentos si hay rate limit.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -275,10 +304,9 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
                 except Exception:
                     pass
 
-        # ---- Intento 2 y 3: HTML
+        # ---- Intento 2-4: HTML con reintentos si hay rate limit
         page = context.new_page()
         item_url = f"{origin}/items/{item_id}"
-        page.goto(item_url, wait_until="domcontentloaded", timeout=30_000)
 
         title = ""
         price_val = ""
@@ -287,50 +315,76 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
         size = ""
         status = ""
 
-        # 2) JSON-LD si existe
-        try:
-            els = page.query_selector_all('script[type="application/ld+json"]')
-            for el in els:
-                data = el.text_content()
-                if not data:
+        for attempt in range(1, 4):
+            page.goto(item_url, wait_until="domcontentloaded", timeout=30_000)
+
+            # ¿rate limited?
+            if is_rate_limited_title(page.title()):
+                if attempt < 3:
+                    backoff_sleep(attempt)
                     continue
-                ld = json.loads(data)
-                if isinstance(ld, dict):
-                    if not title:
-                        title = ld.get("name","") or title
-                    offers = ld.get("offers") or {}
-                    if isinstance(offers, dict):
-                        price_val = price_val or offers.get("price","") or ""
-                        currency  = currency  or offers.get("priceCurrency","") or ""
-                    if isinstance(ld.get("brand"), dict) and not brand:
-                        brand = ld["brand"].get("name","") or brand
-                    if price_val and currency:
-                        break
-        except Exception:
-            pass
+                # si ya es el último intento, seguimos para rascar lo que se pueda
 
-        # 3) Metatags
-        if not title:
-            title = _get_meta(page, "og:title") or page.title()
-        if not price_val:
-            price_val = _get_meta(page, "product:price:amount") or _get_meta(page, "og:price:amount") or ""
-        if not currency:
-            currency = _get_meta(page, "product:price:currency") or _get_meta(page, "og:price:currency") or ""
+            # 2) JSON-LD
+            try:
+                els = page.query_selector_all('script[type="application/ld+json"]')
+                for el in els:
+                    data = el.text_content()
+                    if not data:
+                        continue
+                    ld = json.loads(data)
+                    if isinstance(ld, dict):
+                        if not title:
+                            title = ld.get("name","") or title
+                        offers = ld.get("offers") or {}
+                        if isinstance(offers, dict):
+                            price_val = price_val or offers.get("price","") or ""
+                            currency  = currency  or offers.get("priceCurrency","") or ""
+                        if isinstance(ld.get("brand"), dict) and not brand:
+                            brand = ld["brand"].get("name","") or brand
+                        if price_val and currency and title:
+                            break
+            except Exception:
+                pass
 
-        # 4) DOM directo (clases/testid con 'price' o cualquier nodo con símbolo/ISO)
-        if not price_val or not currency:
-            p_dom, c_dom = _price_from_dom(page, domain_hint)
-            price_val = price_val or p_dom
-            currency  = currency  or c_dom
+            # 3) Metatags
+            if not title:
+                meta_title = _get_meta(page, "og:title")
+                if meta_title and not is_rate_limited_title(meta_title):
+                    title = meta_title
+            if not title:
+                page_title = page.title()
+                if page_title and not is_rate_limited_title(page_title):
+                    title = page_title
 
-        # 5) Atributos del DOM (Marca/Talla/Estado en varios idiomas)
-        attr_map = _parse_attributes_map(page)
-        if not brand:
-            brand = _pick_attr(attr_map, ["marca","brand","marque","marke","merk","marca de"])
-        if not size:
-            size = _pick_attr(attr_map, ["talla","size","taille","größe","maat","taglia","rozmiar"])
-        if not status:
-            status = _pick_attr(attr_map, ["estado","condition","état","zustand","condición"])
+            # 3.b) Título por DOM (fallback)
+            if not title:
+                title = title_from_dom(page)
+
+            if not price_val:
+                price_val = _get_meta(page, "product:price:amount") or _get_meta(page, "og:price:amount") or ""
+            if not currency:
+                currency = _get_meta(page, "product:price:currency") or _get_meta(page, "og:price:currency") or ""
+
+            # 4) DOM directo para precio
+            if not price_val or not currency:
+                p_dom, c_dom = _price_from_dom(page, domain_hint)
+                price_val = price_val or p_dom
+                currency  = currency  or c_dom
+
+            # Atributos
+            attr_map = _parse_attributes_map(page)
+            if not brand:
+                brand = _pick_attr(attr_map, ["marca","brand","marque","marke","merk","marca de"])
+            if not size:
+                size = _pick_attr(attr_map, ["talla","size","taille","größe","maat","taglia","rozmiar"])
+            if not status:
+                status = _pick_attr(attr_map, ["estado","condition","état","zustand","condición"])
+
+            if not title and attempt < 3:
+                backoff_sleep(attempt)
+                continue
+            break  # salimos del bucle de reintentos
 
         if not currency:
             currency = default_currency_for_domain(domain_hint)
@@ -365,7 +419,10 @@ def main():
         items.append(fetch_item_detail_with_browser(iid, ORIGIN, DOMAIN_HINT))
         if i % 10 == 0:
             print(f"[detail] fetched {i}/{len(ids)}")
-        time.sleep(0.05)
+        # Ritmo más suave para evitar 429
+        time.sleep(random.uniform(0.8, 1.6))
+        if i % 25 == 0:
+            time.sleep(random.uniform(6, 9))
 
     print(f"Total artículos extraídos: {len(items)}")
     if items:
