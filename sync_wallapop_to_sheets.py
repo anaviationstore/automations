@@ -3,7 +3,7 @@ import os
 import json
 import time
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -14,6 +14,8 @@ WALLAPOP_PROFILE_URL = os.getenv("WALLAPOP_PROFILE_URL", "").strip()  # URL púb
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_TAB = os.getenv("SHEET_TAB", "wallapop_items").strip()
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON", "").strip()
+HEADLESS = os.getenv("HEADLESS", "true").strip().lower() != "false"
+PAGE_LOCALE = os.getenv("PAGE_LOCALE", "es-ES").strip()
 
 if not (WALLAPOP_PROFILE_URL and SHEET_ID and GOOGLE_SA_JSON):
     raise SystemExit("Faltan variables: WALLAPOP_PROFILE_URL, SHEET_ID o GOOGLE_SA_JSON")
@@ -52,10 +54,6 @@ def get_sheet():
     print(f"Worksheet title: {ws.title}")
     return ws
 
-def write_headers(ws):
-    ws.clear()
-    ws.update(range_name="A1", values=[HEADERS])
-
 def _col_letter(n: int) -> str:
     s = ""
     while n:
@@ -63,28 +61,53 @@ def _col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-def write_headers(ws):
+def write_headers_and_clear_data_block(ws):
+    """
+    - No borra toda la hoja.
+    - Mantiene la fila 1 (cabeceras).
+    - Limpia solo el rectángulo de datos A2..(end_col,row_count).
+    """
     end_col = _col_letter(len(HEADERS))
+    last_row = ws.row_count
 
-    # Limpia SOLO el rango de columnas que usamos (A..end_col) en todas las filas
-    # dejando intacto cualquier cosa fuera de ese rango (p.ej. tus columnas de notas).
-    try:
-        ws.batch_clear([f"A1:{end_col}{ws.row_count}"])
-    except AttributeError:
-        # Fallback si tu versión de gspread no tiene batch_clear:
-        # borra el área escribiendo cadenas vacías.
-        empty = [[""] * len(HEADERS) for _ in range(ws.row_count)]
-        ws.update(f"A1:{end_col}{ws.row_count}", empty, value_input_option="RAW")
-
-    # Reescribe cabeceras
+    # Reescribe cabeceras por si no estaban
     ws.update("A1", [HEADERS])
 
+    # Limpia SOLO el bloque donde escribimos (sin tocar otras columnas)
+    rng = f"A2:{end_col}{last_row}"
+    try:
+        ws.batch_clear([rng])
+    except AttributeError:
+        # Fallback si tu gspread no tiene batch_clear
+        empty_rows = last_row - 1
+        if empty_rows > 0:
+            ws.update(rng, [[""] * len(HEADERS) for _ in range(empty_rows)], value_input_option="RAW")
+
+def write_rows(ws, rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    values = [[row.get(col, "") for col in HEADERS] for row in rows]
+
+    # Asegura espacio suficiente (sin tocar otras columnas)
+    need = len(values) - (ws.row_count - 1)
+    if need > 0:
+        ws.add_rows(need)
+
+    end_col = _col_letter(len(HEADERS))
+    ws.update(
+        range_name=f"A2:{end_col}{len(values) + 1}",
+        values=values,
+        value_input_option="RAW"
+    )
+
 # ============ Scraping helpers ============
-def normalize_price(raw: Optional[str]) -> (str, str):
+def normalize_price(raw: Optional[str]) -> Tuple[str, str]:
     if not raw:
         return "", ""
     txt = raw.strip()
-    currency = "€" if "€" in txt else ""
+    currency = ""
+    if "€" in txt or "EUR" in txt.upper():
+        currency = "€"
     digits = []
     for ch in txt:
         if ch.isdigit() or ch in [".", ","]:
@@ -93,91 +116,119 @@ def normalize_price(raw: Optional[str]) -> (str, str):
     return (num, currency)
 
 def parse_json_ld(block_text: str) -> Dict[str, Any]:
-    out = {}
+    """
+    Intenta extraer datos de Product en JSON-LD.
+    """
+    out: Dict[str, Any] = {}
     try:
         data = json.loads(block_text)
     except json.JSONDecodeError:
         return out
+
     nodes = data if isinstance(data, list) else [data]
     for node in nodes:
         if not isinstance(node, dict):
             continue
-        t = node.get("@type") or node.get("@type".lower(), None)
+        t = node.get("@type")
         if (isinstance(t, list) and "Product" in t) or t == "Product":
             product = node
-        else:
-            continue
-        out["title"] = product.get("name", "")
-        out["description"] = product.get("description", "")
-        images = product.get("image")
-        if isinstance(images, list) and images:
-            out["image"] = images[0]
-        elif isinstance(images, str):
-            out["image"] = images
-        else:
-            out["image"] = ""
-        offers = product.get("offers") or {}
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-        out["price"] = str(offers.get("price", "")) if offers else ""
-        out["currency"] = offers.get("priceCurrency", "") if offers else ""
-        out["url"] = product.get("url", "")
-        out["id"] = product.get("sku", "") or product.get("productID", "") or ""
-        brand = product.get("brand", "")
-        out["brand"] = brand.get("name", "") if isinstance(brand, dict) else (brand or "")
-        out["condition"] = product.get("itemCondition", "")
-        category = product.get("category", "")
-        out["category"] = ", ".join(category) if isinstance(category, list) else (category or "")
-        area = product.get("areaServed") or product.get("productionPlace") or ""
-        out["location"] = area.get("name", "") if isinstance(area, dict) else (area or "")
-        return out
+
+            out["title"] = product.get("name", "") or ""
+            out["description"] = product.get("description", "") or ""
+
+            images = product.get("image")
+            if isinstance(images, list) and images:
+                out["image"] = images[0]
+            elif isinstance(images, str):
+                out["image"] = images
+            else:
+                out["image"] = ""
+
+            offers = product.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            if isinstance(offers, dict):
+                price = offers.get("price", "")
+                out["price"] = str(price) if price is not None else ""
+                out["currency"] = offers.get("priceCurrency", "") or ""
+            else:
+                out["price"] = ""
+                out["currency"] = ""
+
+            out["url"] = product.get("url", "") or ""
+            out["id"] = product.get("sku", "") or product.get("productID", "") or ""
+
+            brand = product.get("brand", "")
+            out["brand"] = brand.get("name", "") if isinstance(brand, dict) else (brand or "")
+
+            out["condition"] = product.get("itemCondition", "") or ""
+
+            category = product.get("category", "")
+            out["category"] = ", ".join(category) if isinstance(category, list) else (category or "")
+
+            area = product.get("areaServed") or product.get("productionPlace") or ""
+            out["location"] = area.get("name", "") if isinstance(area, dict) else (area or "")
+
+            return out
     return out
 
 def extract_with_selectors(page) -> Dict[str, Any]:
-    data = {}
-    def safe_text(selector: str, timeout=1200) -> str:
+    data: Dict[str, Any] = {}
+
+    def safe_text(selector: str, timeout=2500) -> str:
         try:
             el = page.wait_for_selector(selector, timeout=timeout)
             return (el.inner_text() or "").strip()
         except Exception:
             return ""
-    def safe_attr(selector: str, attr: str, timeout=1200) -> str:
+
+    def safe_attr(selector: str, attr: str, timeout=2500) -> str:
         try:
             el = page.wait_for_selector(selector, timeout=timeout)
             return (el.get_attribute(attr) or "").strip()
         except Exception:
             return ""
+
     data["title"] = safe_text("h1, h1[itemprop='name'], [data-e2e='product-title']")
     raw_price = safe_text("[data-e2e='product-price'], [itemprop='price'], .MoneyAmount__amount, .price")
     price, currency = normalize_price(raw_price)
     data["price"] = price
     data["currency"] = currency
-    data["description"] = safe_text("[data-e2e='product-description'], [itemprop='description'], .description")
-    data["image"] = safe_attr("img[itemprop='image'], .swiper img, .product-image img, .Image__img", "src")
+    data["description"] = safe_text("[data-e2e='product-description'], [itemprop='description'], .description, [data-testid='product-detail-description']")
+    data["image"] = safe_attr("img[itemprop='image'], .swiper img, .product-image img, .Image__img, img[fetchpriority]", "src")
+    # Campos opcionales (pueden no existir en Wallapop)
     data["condition"] = safe_text("text=Estado") or safe_text("text=Condición")
     data["brand"] = safe_text("text=Marca")
     data["category"] = safe_text("a[href*='/categoria/'], [data-e2e='product-category']")
-    data["location"] = safe_text("[data-e2e='product-location'], .location")
+    data["location"] = safe_text("[data-e2e='product-location'], .location, [data-testid='product-detail-location']")
     return data
 
 def fetch_item_detail(page, url: str, seller_name: str, seller_url: str) -> Dict[str, Any]:
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    # JSON-LD primero
-    jsonld_blocks = []
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except PlaywrightTimeoutError:
+        # Reintento rápido
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+    # Captura JSON-LD si existe
+    parsed: Dict[str, Any] = {}
     try:
         els = page.query_selector_all('script[type="application/ld+json"]')
-        jsonld_blocks = [el.text_content() for el in els if el and el.text_content()]
+        for el in els or []:
+            txt = el.text_content()
+            if not txt:
+                continue
+            parsed = parse_json_ld(txt)
+            if parsed:
+                break
     except Exception:
         pass
-    parsed = {}
-    for block in jsonld_blocks:
-        parsed = parse_json_ld(block)
-        if parsed:
-            break
+
     # Fallback por selectores
     if not parsed or not parsed.get("title"):
         sel_parsed = extract_with_selectors(page)
         parsed = {**sel_parsed, **parsed} if parsed else sel_parsed
+
     # ID desde URL si no vino
     item_id = parsed.get("id") or ""
     if not item_id:
@@ -187,10 +238,12 @@ def fetch_item_detail(page, url: str, seller_name: str, seller_url: str) -> Dict
                 item_id = path[-1]
         except Exception:
             item_id = ""
+
     parsed["url"] = parsed.get("url") or url
     parsed["seller_name"] = seller_name
     parsed["seller_url"] = seller_url
     parsed["timestamp_utc"] = datetime.utcnow().isoformat()
+
     # Normaliza todas las columnas
     row = {k: parsed.get(k, "") for k in HEADERS}
     row["id"] = item_id
@@ -198,48 +251,80 @@ def fetch_item_detail(page, url: str, seller_name: str, seller_url: str) -> Dict
 
 def collect_profile_item_urls(page, profile_url: str):
     page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
+
+    # Nombre del vendedor
     try:
         seller_name = page.evaluate("""() => {
-            const el = document.querySelector('h1, [data-e2e="user-name"], .user__name');
+            const el = document.querySelector('h1, [data-e2e="user-name"], .user__name, [data-testid="user-name"]');
             return el ? el.textContent.trim() : "";
         }""")
     except Exception:
         seller_name = ""
     seller_url = profile_url
+
+    # Scroll infinito hasta estabilizar
     seen = set()
     stable_rounds = 0
     last_count = 0
-    for _ in range(60):
+    MAX_ROUNDS = 80
+
+    for _ in range(MAX_ROUNDS):
+        # Intenta cerrar banners/cookies si aparecen
+        try:
+            page.locator("button:has-text('Aceptar')").first.click(timeout=1000)
+        except Exception:
+            pass
+
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(0.7)
+        time.sleep(0.8)
+
         try:
             urls = page.evaluate("""() => {
-                const anchors = Array.from(document.querySelectorAll('a[href*="/item/"], a[href*="/product/"], a[href*="/producto/"]'));
-                return anchors.map(a => new URL(a.href, location.origin).href);
+                const anchors = Array.from(document.querySelectorAll(
+                    'a[href*="/item/"], a[href*="/product/"], a[href*="/producto/"]'
+                ));
+                return anchors.map(a => new URL(a.getAttribute('href'), location.origin).href.split('?')[0]);
             }""")
         except Exception:
             urls = []
+
         for u in urls:
-            seen.add(u.split("?")[0])
+            seen.add(u)
+
         if len(seen) == last_count:
             stable_rounds += 1
         else:
             stable_rounds = 0
             last_count = len(seen)
+
         if stable_rounds >= 3:
             break
+
     return seller_name, seller_url, sorted(seen)
 
+# ============ Main ============
 def run():
     ws = get_sheet()
-    write_headers(ws)  # <-- igual que Vinted: limpia y pone cabeceras
+    # Limpia solo nuestro bloque de columnas (A..end_col) desde la fila 2
+    write_headers_and_clear_data_block(ws)
+
     rows: List[Dict[str, Any]] = []
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="es-ES")
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(
+            locale=PAGE_LOCALE,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
         page = context.new_page()
+
         seller_name, seller_url, item_urls = collect_profile_item_urls(page, WALLAPOP_PROFILE_URL)
         print(f"Encontrados {len(item_urls)} items en el perfil.")
+
         for idx, url in enumerate(item_urls, 1):
             try:
                 row = fetch_item_detail(page, url, seller_name, seller_url)
@@ -248,10 +333,13 @@ def run():
                     print(f"[{idx}/{len(item_urls)}] Procesados 30 ítems…")
             except Exception as e:
                 print(f"Error al procesar {url}: {e}")
+
         context.close()
         browser.close()
+
     if rows:
         write_rows(ws, rows)
+
     print("Finalizado.")
 
 if __name__ == "__main__":
