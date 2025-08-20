@@ -1,0 +1,12 @@
+# Sesión y secretos locales
+vinted_state.json
+*.b64
+.env
+
+# Entorno y cachés
+.venv/
+__pycache__/
+*.pyc
+
+# Editor (opcional)
+.vscode/
