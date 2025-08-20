@@ -63,16 +63,21 @@ def _col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-def write_rows(ws, rows: List[Dict[str, Any]]):
-    if not rows:
-        return
-    values = [[row.get(col, "") for col in HEADERS] for row in rows]
-    # Asegura espacio suficiente
-    need = len(values) - (ws.row_count - 1)
-    if need > 0:
-        ws.add_rows(need)
+def write_headers(ws):
     end_col = _col_letter(len(HEADERS))
-    ws.update(range_name=f"A2:{end_col}{len(values)+1}", values=values, value_input_option="RAW")
+
+    # Limpia SOLO el rango de columnas que usamos (A..end_col) en todas las filas
+    # dejando intacto cualquier cosa fuera de ese rango (p.ej. tus columnas de notas).
+    try:
+        ws.batch_clear([f"A1:{end_col}{ws.row_count}"])
+    except AttributeError:
+        # Fallback si tu versión de gspread no tiene batch_clear:
+        # borra el área escribiendo cadenas vacías.
+        empty = [[""] * len(HEADERS) for _ in range(ws.row_count)]
+        ws.update(f"A1:{end_col}{ws.row_count}", empty, value_input_option="RAW")
+
+    # Reescribe cabeceras
+    ws.update("A1", [HEADERS])
 
 # ============ Scraping helpers ============
 def normalize_price(raw: Optional[str]) -> (str, str):
