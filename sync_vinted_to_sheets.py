@@ -32,13 +32,39 @@ sh = gc.open_by_key(SHEET_ID)
 try:
     ws = sh.worksheet(SHEET_TAB)
 except gspread.exceptions.WorksheetNotFound:
-    ws = sh.add_worksheet(title=SHEET_TAB, rows=2, cols=8)
+    # crea con margen por si añades columnas propias a la derecha
+    ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=20)
 
 HEADERS = ["id","title","price","currency","url","brand","size","status"]
 
-def write_headers():
-    ws.clear()
-    ws.update(range_name="A1:H1", values=[HEADERS])
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def write_headers_and_clear_data_block():
+    """
+    - No borra toda la hoja.
+    - Mantiene la fila 1 (cabeceras).
+    - Limpia solo A2..(end_col,last_row) donde escribimos nuestros datos.
+    """
+    end_col = _col_letter(len(HEADERS))
+    last_row = max(2, ws.row_count)
+
+    # Reescribe cabeceras por si acaso
+    ws.update("A1", [HEADERS])
+
+    rng = f"A2:{end_col}{last_row}"
+    try:
+        # batch_clear está en el objeto Spreadsheet, no en Worksheet
+        ws.spreadsheet.batch_clear([rng])
+    except Exception:
+        # Fallback: sobreescribe con vacío
+        empty_rows = last_row - 1
+        if empty_rows > 0:
+            ws.update(rng, [[""] * len(HEADERS) for _ in range(empty_rows)], value_input_option="RAW")
 
 def write_rows(items):
     if not items:
@@ -47,10 +73,14 @@ def write_rows(items):
         it.get("id",""), it.get("title",""), it.get("price",""), it.get("currency",""),
         it.get("url",""), it.get("brand",""), it.get("size",""), it.get("status",""),
     ] for it in items]
+
+    # Asegura espacio suficiente (sin tocar otras columnas)
     need = len(rows) - (ws.row_count - 1)
     if need > 0:
         ws.add_rows(need)
-    ws.update(range_name=f"A2:H{len(rows)+1}", values=rows)
+
+    end_col = _col_letter(len(HEADERS))
+    ws.update(range_name=f"A2:{end_col}{len(rows)+1}", values=rows)
 
 # ---------- Utilidades precio/moneda ----------
 CURRENCY_MAP = {
@@ -323,7 +353,6 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
                 if attempt < 3:
                     backoff_sleep(attempt)
                     continue
-                # si ya es el último intento, seguimos para rascar lo que se pueda
 
             # 2) JSON-LD
             try:
@@ -403,7 +432,8 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
 
 # ---------- Main ----------
 def main():
-    write_headers()
+    # Limpia solo nuestro bloque (A..end_col) desde la fila 2 y deja todo lo demás intacto
+    write_headers_and_clear_data_block()
 
     profile_url = ENV_PROFILE
     print("CONFIG:", "ORIGIN=", ORIGIN, "PROFILE_URL=", profile_url, "SHEET_ID=", SHEET_ID)
