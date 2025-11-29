@@ -6,6 +6,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
 
+# ---------- Helpers genéricos ----------
+def as_text(x):
+    if x is None:
+        return ""
+    return str(x)
+
 # ---------- Config ----------
 ENV_PROFILE    = os.getenv("VINTED_PROFILE_URL", "").strip()   # ej: https://www.vinted.es/member/279020986
 SHEET_ID       = os.getenv("SHEET_ID")
@@ -53,8 +59,8 @@ def write_headers_and_clear_data_block():
     end_col = _col_letter(len(HEADERS))
     last_row = max(2, ws.row_count)
 
-    # Reescribe cabeceras por si acaso
-    ws.update("A1", [HEADERS])
+    # Reescribe cabeceras por si acaso (orden nuevo de argumentos)
+    ws.update(values=[HEADERS], range_name="A1")
 
     rng = f"A2:{end_col}{last_row}"
     try:
@@ -64,14 +70,24 @@ def write_headers_and_clear_data_block():
         # Fallback: sobreescribe con vacío
         empty_rows = last_row - 1
         if empty_rows > 0:
-            ws.update(rng, [[""] * len(HEADERS) for _ in range(empty_rows)], value_input_option="RAW")
+            ws.update(
+                values=[[""] * len(HEADERS) for _ in range(empty_rows)],
+                range_name=rng,
+                value_input_option="RAW",
+            )
 
 def write_rows(items):
     if not items:
         return
     rows = [[
-        it.get("id",""), it.get("title",""), it.get("price",""), it.get("currency",""),
-        it.get("url",""), it.get("brand",""), it.get("size",""), it.get("status",""),
+        as_text(it.get("id","")),
+        as_text(it.get("title","")),
+        as_text(it.get("price","")),
+        as_text(it.get("currency","")),
+        as_text(it.get("url","")),
+        as_text(it.get("brand","")),
+        as_text(it.get("size","")),
+        as_text(it.get("status","")),
     ] for it in items]
 
     # Asegura espacio suficiente (sin tocar otras columnas)
@@ -80,7 +96,7 @@ def write_rows(items):
         ws.add_rows(need)
 
     end_col = _col_letter(len(HEADERS))
-    ws.update(range_name=f"A2:{end_col}{len(rows)+1}", values=rows)
+    ws.update(values=rows, range_name=f"A2:{end_col}{len(rows)+1}")
 
 # ---------- Utilidades precio/moneda ----------
 CURRENCY_MAP = {
@@ -322,14 +338,14 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
                         url_item = obj.get("url") or f"{origin}/items/{item_id}"
                         browser.close()
                         return {
-                            "id": obj.get("id", item_id),
-                            "title": obj.get("title",""),
-                            "price": price_val,
-                            "currency": currency or default_currency_for_domain(domain_hint),
-                            "url": url_item,
-                            "brand": obj.get("brand_title",""),
-                            "size": obj.get("size_title",""),
-                            "status": obj.get("status",""),
+                            "id": as_text(obj.get("id", item_id)),
+                            "title": as_text(obj.get("title","")),
+                            "price": as_text(price_val),
+                            "currency": as_text(currency or default_currency_for_domain(domain_hint)),
+                            "url": as_text(url_item),
+                            "brand": as_text(obj.get("brand_title","")),
+                            "size": as_text(obj.get("size_title","")),
+                            "status": as_text(obj.get("status","")),
                         }
                 except Exception:
                     pass
@@ -420,14 +436,14 @@ def fetch_item_detail_with_browser(item_id: str, origin: str, domain_hint: str) 
 
         browser.close()
         return {
-            "id": item_id,
-            "title": (title or "").strip(),
-            "price": (price_val or "").strip(),
-            "currency": (currency or "").strip(),
-            "url": item_url,
-            "brand": (brand or "").strip(),
-            "size": (size or "").strip(),
-            "status": (status or "").strip(),
+            "id": as_text(item_id),
+            "title": as_text(title).strip(),
+            "price": as_text(price_val).strip(),
+            "currency": as_text(currency).strip(),
+            "url": as_text(item_url),
+            "brand": as_text(brand).strip(),
+            "size": as_text(size).strip(),
+            "status": as_text(status).strip(),
         }
 
 # ---------- Main ----------
